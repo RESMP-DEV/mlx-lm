@@ -20,7 +20,7 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, BatchKVCache, KVCache, _BaseCache, dynamic_roll
-from .gated_delta import gated_delta_update
+from .gated_delta import gated_delta_update, normalize_qk
 from .switch_layers import SwitchGLU
 
 
@@ -88,7 +88,14 @@ class ModelArgs(BaseModelArgs):
         self.text.partial_rotary_factor = float(
             rp.get("partial_rotary_factor", self.text.partial_rotary_factor)
         )
-        if not self.text.layer_types:
+        if self.text.layer_types:
+            # transformers defaults emit "qwen_sparse_attention" for the layer
+            # kind the official config spells "full_attention".
+            self.text.layer_types = [
+                "full_attention" if t == "qwen_sparse_attention" else t
+                for t in self.text.layer_types
+            ]
+        else:
             n, k = self.text.num_hidden_layers, self.text.full_attention_interval
             self.text.layer_types = [
                 "full_attention" if (i + 1) % k == 0 else "linear_attention"
@@ -468,9 +475,9 @@ class GatedDeltaNet(nn.Module):
         k = k.reshape(B, S, self.n_k, self.dk)
         v = v.reshape(B, S, self.n_v, self.dv)
 
-        inv_scale = self.dk**-0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        # The reference l2norm adds eps to sum(q^2); rms_norm adds it to the
+        # mean, so convert via normalize_qk to keep the eps semantics exact.
+        q, k = normalize_qk(q, k, inv_scale=self.dk**-0.5, eps=1e-6)
 
         state = cache[1] if cache is not None else None
         out, state = gated_delta_update(
@@ -681,6 +688,9 @@ class NGramEmbedding(nn.Module):
 
 
 _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)\.")
+_PER_EXPERT_RE = re.compile(
+    r"(.*)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj|gate_up_proj)\.weight$"
+)
 
 
 class _ShardedEmbedding(nn.Module):
@@ -1110,6 +1120,7 @@ class Model(nn.Module):
         fold = any(k.startswith("model.language_model.") for k in weights)
 
         out = {}
+        per_expert: dict = {}
         for k, v in weights.items():
             # Multi-token-prediction head and vision tower: not implemented by this
             # text-only port, and absent from the module tree -> drop them.
@@ -1147,6 +1158,20 @@ class Model(nn.Module):
                 out[base + "switch_mlp.down_proj.weight"] = v
                 continue
 
+            # Per-expert layout, as saved by transformers save_pretrained
+            # (`experts.{i}.gate_proj` etc. instead of one stacked tensor).
+            m = _PER_EXPERT_RE.match(k)
+            if m:
+                base, idx, proj = m.group(1), int(m.group(2)), m.group(3)
+                if proj == "gate_up_proj":
+                    mid = v.shape[-2] // 2
+                    slot = per_expert.setdefault(base, {}).setdefault(idx, {})
+                    slot["gate_proj"] = v[..., :mid, :]
+                    slot["up_proj"] = v[..., mid:, :]
+                else:
+                    per_expert.setdefault(base, {}).setdefault(idx, {})[proj] = v
+                continue
+
             # (C, 1, K) torch -> (C, K, 1) mlx. Idempotent: an already converted
             # weight has shape[1] == kernel_size != 1.
             if k.endswith("conv1d.weight") and v.ndim == 3 and v.shape[1] == 1:
@@ -1156,6 +1181,13 @@ class Model(nn.Module):
                 v = 1.0 + v
 
             out[k] = v
+
+        for base, experts in per_expert.items():
+            n = len(experts)
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                out[f"{base}.mlp.switch_mlp.{proj}.weight"] = mx.stack(
+                    [experts[i][proj] for i in range(n)], axis=0
+                )
         return out
 
     @property
