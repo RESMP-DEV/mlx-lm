@@ -1,0 +1,11 @@
+Blocked before artifact delivery: the session filesystem is read-only, and `apply_patch` rejected the write to `research/qwen38-flash/w1_transformers.txt`. I did not modify any repository file.
+
+Research is complete:
+
+- Implementation: `src/transformers/models/qwen4_exp/`, added by Transformers PR [#48337](https://github.com/huggingface/transformers/pull/48337). First tagged release containing the original merge commit is `v5.17.0`.
+- Mechanisms: four-stream low-rank GatedResidual; QSA block-selection sparse attention (`2048 / 4 = 512` blocks plus incomplete tail); PLE hashed n-gram table at layer 2.
+- PLE checkpoint/runtime: 16 hash heads, total runtime shape `[320001536, 160]`, 51.20024576B parameters, 95.368 GiB BF16; `split_ngram_parts=128` only controls checkpoint shard concatenation.
+- MTP: Transformers ignores `mtp.*`; external runtime code shows a standalone one-layer full-attention draft fusing target four-stream hidden state with next-token embeddings.
+- Full report content was prepared, including the architecture delta table and MLX port implications.
+
+Unresolved failure: no output file exists because writes are prohibited by the current sandbox and approval policy.

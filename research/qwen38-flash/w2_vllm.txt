@@ -1,0 +1,113 @@
+I completed the research, but could not create the requested output file: this session’s filesystem is read-only, and `apply_patch` rejected `/tmp/qwen4_exp_vllm_research.md`. No repository files were modified. The report content is below.
+
+# Qwen4Exp / Qwen3.8-Flash-Next in vLLM and adjacent kernels
+
+## Summary
+
+- vLLM support is merged: [PR #53896](https://github.com/vllm-project/vllm/pull/53896), merged `2026-08-31T05:57:56Z`.
+- The model is not under `vllm/model_executor/models/qwen4_exp.py`; it is at [`vllm/models/qwen4_exp/`](https://github.com/vllm-project/vllm/tree/main/vllm/models/qwen4_exp), with NVIDIA/AMD variants.
+- Registry maps `Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration`, and `Qwen4ExpMTP` to `vllm.models.qwen4_exp` in [`registry.py`](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/registry.py).
+- Qwen4Exp extends Qwen3Next with HC multi-stream state, PLE n-gram conditioning, QSA sparse attention/side caches, and MTP using pre-final-mixer hidden state.
+- PLE is model-internal conditioning, not lossless n-gram speculation; MTP is learned speculation and reuses step-0 QSA selections.
+- Most acceleration beyond baseline is open/draft: PrimTS QSA, SM90 native QSA, FP8/NVFP4 QSA KV, fused draft metadata, FP8 MTP head, AMD fused pre-indexer/HC, CPU backend, and sequence parallelism.
+
+## Findings
+
+1. **Merged baseline:** [#53896](https://github.com/vllm-project/vllm/pull/53896) is merged. GitHub metadata reports 51 commits, head `release/qwen38next`, and validation across BF16/FP8/NVFP4. Its example uses `method=mtp`, `num_speculative_tokens=3`, and optional PLE offload.
+2. **File location:** current `main` has no `vllm/model_executor/models/qwen4_exp.py` or `qwen4_exp_text.py`. Actual files include [`config.py`](https://github.com/vllm-project/vllm/blob/main/vllm/models/qwen4_exp/config.py), [`model.py`](https://github.com/vllm-project/vllm/blob/main/vllm/models/qwen4_exp/nvidia/model.py), [`qsa.py`](https://github.com/vllm-project/vllm/blob/main/vllm/models/qwen4_exp/nvidia/qsa.py), and [`mtp.py`](https://github.com/vllm-project/vllm/blob/main/vllm/models/qwen4_exp/nvidia/mtp.py).
+3. **Registry excerpt:**
+
+   ```python
+   "Qwen4ExpForCausalLM": ("vllm.models.qwen4_exp", "Qwen4ExpForCausalLM")
+   "Qwen4ExpForConditionalGeneration": ("vllm.models.qwen4_exp", "Qwen4ExpForConditionalGeneration")
+   "Qwen4ExpMTP": ("vllm.models.qwen4_exp", "Qwen4ExpMTP")
+   ```
+
+4. **Configuration:** [`Qwen4ExpTextConfig`](https://github.com/vllm-project/vllm/blob/main/vllm/models/qwen4_exp/config.py) subclasses `Qwen3NextConfig`, adds HC/PLE/QSA fields, requires `indexer_kv_heads=1`, and requires block top-k `indexer_budget / indexer_compress_ratio` to be 512 or 2048.
+5. **QSA:** [`qsa.py`](https://github.com/vllm-project/vllm/blob/main/vllm/models/qwen4_exp/nvidia/qsa.py) defines `QWEN4_EXP_QSA_TRITON`, supports BF16 main KV on merged main, and pending [#54846](https://github.com/vllm-project/vllm/pull/54846) adds FP8-E4M3/NVFP4 reads. Main KV is `FullAttentionSpec`; QSA also has raw and compressed indexer side caches in [`qsa_cache.py`](https://github.com/vllm-project/vllm/blob/main/vllm/models/qwen4_exp/common/qsa_cache.py).
+6. **Top-k flow:** the indexer writes request-relative token indices plus a count into a packed int32 buffer. [`qsa_pre_indexer`](https://github.com/vllm-project/vllm/blob/main/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py) fuses norm/RoPE/key-store/compression when eligible; otherwise separate compression and decode/prefill selection ops run.
+7. **MTP:** [`mtp.py`](https://github.com/vllm-project/vllm/blob/main/vllm/models/qwen4_exp/nvidia/mtp.py) uses the target’s pre-final-mixer multi-stream hidden state. `set_skip_topk(true)` selects QSA indices on MTP step 0 and reuses them on later steps.
+8. **PLE:** [`ple_layer.py`](https://github.com/vllm-project/vllm/blob/main/vllm/models/qwen4_exp/nvidia/ple_layer.py) looks up n-gram embeddings, dequantizes selected rows, projects/norms/gates them, and adds a dilated depthwise short conv. It has its own recurrent state; it is not speculative or lossless lookahead.
+9. **HC:** [`model.py`](https://github.com/vllm-project/vllm/blob/main/vllm/models/qwen4_exp/nvidia/model.py) wraps attention and MLP in `GatedResidual`, expands hidden state to `hc_count * hidden_size`, can delay combine, and returns both sampled and multi-stream hidden state.
+10. **Pending vLLM acceleration:** [#56240](https://github.com/vllm-project/vllm/pull/56240) PrimTS, [#59010](https://github.com/vllm-project/vllm/pull/59010) SM90 native QSA, [#58449](https://github.com/vllm-project/vllm/pull/58449) fused draft metadata, [#56577](https://github.com/vllm-project/vllm/pull/56577) FP8 MTP head, [#57947](https://github.com/vllm-project/vllm/pull/57947) common AMD pre-indexer, [#58706](https://github.com/vllm-project/vllm/pull/58706) AMD fused HC, [#57294](https://github.com/vllm-project/vllm/pull/57294) CPU backend, [#56322](https://github.com/vllm-project/vllm/pull/56322) sequence parallel.
+11. **PLE loading/offload:** [#54722](https://github.com/vllm-project/vllm/pull/54722) and [#54882](https://github.com/vllm-project/vllm/pull/54882) are merged; [#55334](https://github.com/vllm-project/vllm/pull/55334) and [#56273](https://github.com/vllm-project/vllm/pull/56273) are open; [#53899](https://github.com/vllm-project/vllm/pull/53899) is closed unmerged; [#54070](https://github.com/vllm-project/vllm/pull/54070) is newer open disk offload work.
+12. **vLLM-Ascend [#16981](https://github.com/vllm-project/vllm-ascend/pull/16981):** open/mergeable, reuses upstream model wrappers and adds A3 QSA/Lightning Indexer, W8A8, V1 MTP/spec decode, fixed-address PLE inputs, and native `QsaExpandE3`.
+13. **SGL NPU [#807](https://github.com/sgl-project/sgl-kernel-npu/pull/807):** open/mergeable; adds NPU Triton HC, QSA score/top-k/expansion/sparse attention, and short-conv kernels. Reports 124 kernel and 121 integration tests passed.
+14. **FlagOS [#455](https://github.com/flagos-ai/vllm-plugin-FL/pull/455):** open but conflicting; H100 vLLM 0.24/FlagOS HC/PLE/QSA/runtime stack. The diff exceeds GitHub’s 20k-line API limit, so head files at `refs/pull/455/head` were inspected.
+15. **ROCm/AITER [#5820](https://github.com/ROCm/aiter/pull/5820):** open, gfx950 FlyDSL kernels for HC mix, causal conv prefill, and GDN decode/verify; benchmark-oriented, not full model support.
+
+## New ops and kernels required
+
+| Op / kernel | Purpose | Source |
+|---|---|---|
+| `grouped_gemma_rmsnorm`, `hc_silu`, `hc_gate_mix`, `hc_combine`, `hc_combine_norm` | HyperConnection norm/gate/combine | [#53896](https://github.com/vllm-project/vllm/pull/53896) |
+| `ple_ngram_ids`, `ple_gate`, `ple_conv` + writeback | PLE ID hashing, gated projection, dilated short conv/state | [#53896](https://github.com/vllm-project/vllm/pull/53896) |
+| `build_qsa_metadata_triton` | QSA side-cache metadata and slots | [#53896](https://github.com/vllm-project/vllm/pull/53896) |
+| `qsa_pre_indexer` | Fused indexer norm/RoPE/cache/compression | [#53896](https://github.com/vllm-project/vllm/pull/53896) |
+| `qsa_compress_groups_with_ratio`, `qsa_store_cache_rows` | Compress/store indexer keys | [#53896](https://github.com/vllm-project/vllm/pull/53896) |
+| `expand_qsa_block_indices`, `qsa_select_paged_decode`, `qsa_select_paged_prefill` | Selected-block expansion and MQA top-k | [#53896](https://github.com/vllm-project/vllm/pull/53896) |
+| `qsa_sparse_paged_attention` + split/merge kernels | Sparse paged GQA | [#53896](https://github.com/vllm-project/vllm/pull/53896) |
+| `fused_gdn_decode_post_conv_mtp` | Modified GDN decode for Qwen4Exp/MTP | [#53896](https://github.com/vllm-project/vllm/pull/53896) |
+| `qsa_sm90` | Native SM90 sparse prefill | pending [#59010](https://github.com/vllm-project/vllm/pull/59010) |
+| PrimTS QSA | FlashInfer SM100/SM103 backend | pending [#56240](https://github.com/vllm-project/vllm/pull/56240) |
+| `KV_QUANT_FP8`, `KV_QUANT_NVFP4` | FP8/NVFP4 selected-KV dequant/read | pending [#54846](https://github.com/vllm-project/vllm/pull/54846) |
+| `update_draft_decode_metadata` | MTP QSA metadata reuse | pending [#58449](https://github.com/vllm-project/vllm/pull/58449) |
+| FP8 proposal head | FP8 MTP LM-head projection | pending [#56577](https://github.com/vllm-project/vllm/pull/56577) |
+| common fused pre-indexer | Enable AMD path | pending [#57947](https://github.com/vllm-project/vllm/pull/57947) |
+| `hc_down_silu`, `hc_up_gate_mix` | AMD fused HC | pending [#58706](https://github.com/vllm-project/vllm/pull/58706) |
+| `_lookup_nvfp4_ple_embedding_kernel` | Packed NVFP4 PLE lookup | pending [#56273](https://github.com/vllm-project/vllm/pull/56273) |
+| `QsaExpandE3` / `qsa_expand_e3_out`, Ascend QSA store/compress/select/attention/cache | Ascend-native QSA expansion and attention ops | [#16981](https://github.com/vllm-project/vllm-ascend/pull/16981) |
+| SGL-NPU HC, QSA packed/paged score, `expand_blocks`, `sparse_attention`, `tiled_topk`, `hybrid_topk`, `fast_topk`, `short_conv` | NPU Triton kernels | [#807](https://github.com/sgl-project/sgl-kernel-npu/pull/807) |
+| FlagOS `qwen4_hc_*`, PLE gate/conv/state ops, QSA metadata/score/select/sparse/cache ops | H100 FlagGems/Triton fused variants | [#455](https://github.com/flagos-ai/vllm-plugin-FL/pull/455) |
+| AITER `hc_mix`, causal conv prefill/split, GDN decode-verify / FlyDSL GDR MTP | gfx950 HC/conv/GDN kernels | [#5820](https://github.com/ROCm/aiter/pull/5820) |
+
+## Architecture delta vs qwen3_next
+
+- Reuses Qwen3Next GDN, dense attention projection conventions, and MoE.
+- Adds HC multi-stream state and delayed combine/final mixer.
+- Adds PLE as a second recurrent state and large n-gram lookup.
+- Replaces ordinary full attention with QSA selected-token sparse attention plus indexer side caches.
+- Adds MTP consuming multi-stream target hidden state and reusing QSA step-0 selections.
+- GDN state remains `[batch, value_heads, value_dim, key_dim]`; PLE adds TP-replicated short-conv state; QSA adds `CircularBufferSpec`/`MLAAttentionSpec` side caches.
+- vLLM GDN prefill chunk size is backend-dependent; fused decode state dtype selector is `{float32, bfloat16}`. MLX core’s fused chunk is `C=8`.
+
+## MLX port implications
+
+Already present locally:
+
+- `mx.fast.scaled_dot_product_attention` supports GQA/MQA and masks.
+- `mx.fast.gated_delta_update` and Metal kernels exist, including instantiation for `Dk=128`, `Dv=128`, `Hk=16`, `Hv=48`.
+- mlx-lm already has Qwen3Next GDN, cache handling, MoE, and custom gated-delta kernels.
+- `mx.conv1d` supports grouped dilated convolution.
+- `mx.topk`, `argsort`, `cumsum`, and `logsumexp` can provide a correct eager indexer.
+
+Needs new work:
+
+- HC wrappers and later fused Metal HC kernels.
+- Selective PLE embedding lookup/dequantization and PLE state rollback.
+- Fused PLE gate/norm/conv Metal path.
+- QSA side-cache metadata, compressed/raw key caches, paged top-k, expansion, and sparse gather attention.
+- MTP runtime carrying multi-stream hidden state and QSA index reuse.
+- FP8/NVFP4 dequantization if targeting common quantized checkpoints.
+
+## Open questions
+
+- Target baseline: merged #53896, current main, or a pending acceleration stack?
+- Is BF16/dense-reference first acceptable, or is a specific FP8/NVFP4 checkpoint required immediately?
+- How should the PLE table be stored and paged in MLX?
+- Is QSA required for correctness, or can dense full attention be an initial fallback?
+- Which GDN numerical contract is required, given vLLM’s backend-dependent chunking?
+- Are the Ascend/FlagOS/AITER PRs target implementations or corroboration only?
+
+## Validation and blocker
+
+Checked successfully:
+
+- GitHub PR/issue searches and PR metadata.
+- Raw merged vLLM source, registry mappings, kernel source, cache/state paths.
+- PR head sources for Ascend, SGL NPU, FlagOS, and AITER.
+- Local MLX and mlx-lm symbol/kernel inspection.
+
+Not completed:
+
+- Writing `/tmp/qwen4_exp_vllm_research.md` failed because the session is read-only. No output file or repository file was changed.

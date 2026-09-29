@@ -1,0 +1,109 @@
+The research is complete, but the designated output file could not be written: `apply_patch` was rejected by the read-only sandbox. `research/qwen38-flash/w5_qwen_upstream.txt` remains empty, and no repository files were modified. The full report is below.
+
+# Qwen3.8-Flash-Next: architecture from official, Megatron, and runtime sources
+
+## Summary
+
+- Flash-Next retains a 48-layer, 3:1 GDN:attention hybrid and MoE, but replaces dense/full attention with **Qwen Sparse Attention (QSA)**, widens residuals to **four Gated Residual (GR) streams**, and adds a hashed **n-gram/PLE** capacity layer at layer 2.
+- QSA is trained approximate sparse attention, not lossless dense attention: a 4-query/1-key MQA indexer selects up to 512 four-token blocks plus the incomplete tail, then the core GQA attention runs over those tokens.
+- GR reads a sigmoid-gated, per-channel mean of four normalized residual banks and writes scalar-gated sublayer outputs to every bank. It replaces sublayer pre-normalization and the final RMSNorm.
+- The n-gram/PLE path is lexical capacity injection, not a speculative decoder. Sixteen prime-sized hashed heads contain about 320.0M rows × 160 dimensions, or 51.20B parameters.
+- Megatron PR 7393 implements QSA, GR, PLE, and sigmoid GDN output gating for training. It does **not** implement MTP, Megatron inference caches, or context parallelism in the new modules.
+- Fast serving combines QSA for long context, fixed-state GDN, host-offloaded n-gram tables, and optional NEXTN/MTP speculation. SGLang’s Qwen3.8-Max example uses three MTP steps/four draft tokens.
+
+## Findings
+
+1. **Official model card** — [README](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/README.md) names QSA, Gated Residual, N-gram Embedding, and Muon/AdamW training. It describes QSA as micro-block selection, GR as element-wise data-dependent reads plus per-branch scalar writes, and n-gram lookup as memory-efficient capacity scaling. The [FP8 README](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/resolve/main/README.md) repeats the architecture and specifies 128-block fine-grained FP8.
+2. **QwenLM repository** — [QwenLM/Qwen3.8-Flash-Next](https://github.com/QwenLM/Qwen3.8-Flash-Next) explicitly calls Flash-Next the Qwen3-Next analogue for Qwen4. Its news entry says: “2026-08-26: We release Qwen3.8-Flash-Next.” There are no GitHub releases. The [technical report](https://github.com/QwenLM/Qwen3.8-Flash-Next/blob/main/tech_report.pdf) is dated 2026-08-26.
+3. **Megatron PR 7393** — [NVIDIA/Megatron-LM#7393](https://github.com/NVIDIA/Megatron-LM/pull/7393) is open/unmerged, opened 2026-09-16, with 13 changed files. Its body says the work adds Qwen4-Exp blocks “on top of the Qwen3-Next GDN + gated attention + MoE hybrid that megatron-core already supports.” New files implement `qsa.py`, `per_layer_embedding.py`, and GR in `hyper_connection.py`.
+4. **Megatron QSA** — PR 7393’s `QSAIndexer` projects 4 query heads and 1 shared key head, RMS-normalizes and RoPEs them, mean-pools complete key blocks before norm/RoPE, scores `sum_h relu(q.k)/sqrt(d)`, and hard-top-k selects blocks without gradient. `QSACoreAttention` uses dense attention only when every visible block is selected; otherwise it uses block-sparse FlexAttention.
+5. **Megatron GR** — PR 7393 implements:
+   ```text
+   xn       = GroupRMSNorm(x)
+   mix      = sigmoid(W_up silu(W_down xn / n))
+   block_in = mean_j(mix_j * xn_j)
+   inject   = 2 * sigmoid(W_inject xn / n)
+   x_new_j  = x_j + inject_j * F(block_in)
+   ```
+   `GatedResidualOutputMixer` applies the read-only form and replaces the final layer norm.
+6. **Megatron PLE** — PR 7393’s `per_layer_embedding.py` computes segment-relative positions, resets at EOS and packed-sequence boundaries, derives per-layer SplitMix64 multipliers, assigns each of 16 heads a distinct prime table above 20M rows, and stores the table as a `VocabParallelEmbedding`.
+7. **Megatron delta/limitations** — It changes GDN output gating from historical SiLU to configurable sigmoid, disables fused input/pre-MLP norms for GR, inserts PLE before layer 2, and replaces the final norm with GR mixing. It does not implement MTP, `inference_context` for QSA/PLE, CP, or pipeline parallelism >1 in the new modules.
+8. **SkyRL PR 2216** — [NovaSky-AI/SkyRL#2216](https://github.com/NovaSky-AI/SkyRL/pull/2216) is integration rather than an architecture patch: it pins Megatron/Bridge feature branches, upgrades vLLM to 0.29.0, forces text-only Megatron bridging, and patches vLLM’s Qwen4-Exp classes with `is_3d_moe_weight=True` so fused 3D MoE LoRA uses the correct wrapper.
+9. **SGLang PR 36664** — [sgl-project/sglang#36664](https://github.com/sgl-project/sglang/pull/36664) targets Qwen3.8-Max. “Residue” is a quantization format: stock ModelOpt NVFP4 plus `residue_kernel_metadata.json`, supporting `extended_k` ratios 1/8, 1/4, 1/2 and full-rank `mext_r1`. Its validated launch uses `NEXTN`, 3 steps, top-1, and 4 draft tokens.
+10. **SGLang PR 39724** — [sgl-project/sglang#39724](https://github.com/sgl-project/sglang/pull/39724) adds Qwen4-Exp collocated prefill CP. It gathers globally ordered rows for PLE/GDN, all-gathers QSA index/KV data, scores only local queries, and exposes `index_share_for_mtp_iteration=True`.
+11. **Runtime QSA state** — At PR 39724’s head, [`qsa_indexer.py`](https://github.com/sgl-project/sglang/blob/fc9cbc3248dee81534112609b04e7a2ca9b25912/python/sglang/srt/layers/attention/qsa/qsa_indexer.py) maintains compressed per-layer index-K state and returns logical indices of width `2048 + 4 - 1 = 2051`. [`qwen_sparse_attn_backend.py`](https://github.com/sgl-project/sglang/blob/fc9cbc3248dee81534112609b04e7a2ca9b25912/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py) gathers selected raw K/V and uses TRT-LLM sparse decode or FlashAttention fallback.
+12. **Serving semantics** — The technical report reports QSA speedups of 7.6× prefill and 4.9× decode at 1M context. QSA is the target model’s attention semantics at long context. MTP is speculative; the n-gram head is neither lossless lookahead decoding nor an output head.
+
+## Mechanism mechanics
+
+### N-gram head / hashed table
+
+Sixteen heads are formed from `(ngram_size - 1) * heads_per_ngram = 2 * 8`. Each head has its own prime row count beginning above 20M and a `2560 / 16 = 160` dimension. The first 16 primes after 20M sum to 320,001,446 rows; at 160 dimensions this is 51,200,231,360 parameters.
+
+Bigrams and trigrams ending at each token are hashed independently. Context resets at EOS/document and packed-sequence boundaries. The table is deterministic, checkpoint metadata is persisted, and the raw token IDs must be passed to PLE because decoder layers otherwise see only embeddings.
+
+### PLE
+
+PLE sits before layer 2’s attention sublayer and updates all four residual banks:
+
+```text
+e      = concat(E_head[hash_head(ngram_ending_at_t)])
+key    = GroupRMSNorm(Wk e)
+value  = Wv e
+gate_j = signed_sqrt(<key_j, GroupRMSNorm(x)_j> / sqrt(C))
+g      = sigmoid(gate_j) * value
+update = g + silu(DilatedDepthwiseCausalConv(GroupRMSNorm(g)))
+bank  += update
+```
+
+The convolution has kernel size 4 and dilation 3, giving a nine-token causal halo.
+
+### QSA
+
+For query `i`, complete key groups of `r=4` are average-pooled before RoPE. A pooled key receives its block-start position; queries retain their token positions. The score is:
+
+```text
+I[i,b] = sum_h ReLU(<q[i,h], kbar[b]>) / sqrt(D)
+B[i]   = top_512(I[i,:])
+S[i]   = expand(B[i]) ∪ tokens(floor(i/r)*r .. i)
+```
+
+Core GQA attention runs over `S[i]`. With budget 2048 and ratio 4, sequences up to 2051 tokens select every visible complete block, so dense attention is exact there. Longer contexts use the trained sparse semantics.
+
+### Gated Residual
+
+GR uses four banks of hidden size 2,560. Each attention and MLP sublayer has its own GR read/write module. It applies zero-centered RMSNorm to each bank, predicts an element-wise read gate through a rank-320 bottleneck, averages gated banks, runs the sublayer without a separate input norm, then writes the scalar-gated output to all banks. The final GR mixer emits the normal 2,560-wide hidden state for logits.
+
+### MTP
+
+The official text config defines one hybrid MTP full-attention layer. The technical report says all MTP full-attention layers are QSA and that top-k indices are reused across speculative steps. SGLang’s MTP implementation copies the text config, sets one layer and `full_attention_interval=1`, combines normalized embeddings with the target hidden state through `fc`, runs that layer, and computes logits. Drafting remains speculative and requires target verification.
+
+## Family facts
+
+- **Dates:** HF repository created 2026-08-24, last modified 2026-08-27; QwenLM README says released 2026-08-26.
+- **Parameters:** 125B backbone, 6B active, plus 51B n-gram and 4B MTP. The n-gram calculation verifies 51.20B.
+- **Topology:** 12 × `[GDN, GDN, GDN, QSA]`; GR at every attention/MLP sublayer; PLE at layer 2.
+- **Attention:** GDN 16 QK / 48 V heads, width 128, conv kernel 4. QSA core 24 Q / 2 KV heads, width 256, partial RoPE 0.25; indexer 4Q/1K, width 128, budget 2048, ratio 4.
+- **MoE:** 512 routed experts, top-10 plus one shared, expert intermediate size 640.
+- **Tokenizer/context:** `Qwen2Tokenizer`; padded vocab 248,320; native context 262,144, extensible to 1M with YaRN.
+- **License:** Qwen Community License 1.0, with attribution conditions above 100M MAU or US$20M monthly revenue and separate-license conditions for some commercial MaaS/AI-work-assistant uses.
+
+## MLX port implications
+
+- `mlx_lm/models/qwen3_next.py` is a structural baseline only. It has one residual stream, ordinary pre-norms, dense gated attention, and SiLU-gated GDN output; all four differ from Qwen4-Exp.
+- GDN can reuse existing MLX delta-rule machinery, but the output gate must be sigmoid and checkpoint mappings must be checked. Per sequence per GDN layer, recurrent state is about 817,152/TP elements: conv `(10240/TP, 3)` plus temporal `(48/TP, 128, 128)`.
+- The residual bank must become a real four-stream layout. Both attention and MLP need separate GR modules; decode should keep the bank as state until the final mixer.
+- QSA cannot be omitted beyond 2,051 tokens. A short-context MLX path may use dense attention, but the advertised model needs compressed index keys, top-512 block selection, tail handling, full raw KV, and selected-token sparse attention.
+- PLE is the largest memory obstacle: about 102.4 GB in unpadded BF16 before the backbone. MLX needs mmap/pinned/offload support, deterministic hashing, prime offsets, quantization, prefetch, n-gram history state, and nine-step PLE convolution state.
+- Ship a verified non-speculative text model first. MTP should be added later as NEXTN draft/target verification with QSA index sharing. Megatron PR 7393 does not provide MTP code.
+- The released checkpoint is a VLM wrapper. Text-only support is a reasonable first milestone, but full support eventually needs the vision tower and multimodal preprocessing.
+
+## Open questions
+
+- Exact Transformers revision and canonical checkpoint-loading implementation.
+- Whether PLE resets at text-config EOS 248044 only or also chat EOS 248046.
+- Intended MLX n-gram quantization/offload layout.
+- Whether QSA-backed MTP will permanently require top-1 draft verification.
+- Final merged revisions of Megatron 7393 and SGLang 36664/39724; all inspected PRs were still open.
+
+Sources: [base README](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/README.md), [FP8 README](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/resolve/main/README.md), [QwenLM repo](https://github.com/QwenLM/Qwen3.8-Flash-Next), [technical report](https://github.com/QwenLM/Qwen3.8-Flash-Next/blob/main/tech_report.pdf), [Megatron PR 7393](https://github.com/NVIDIA/Megatron-LM/pull/7393), [SkyRL PR 2216](https://github.com/NovaSky-AI/SkyRL/pull/2216), [SGLang PR 36664](https://github.com/sgl-project/sglang/pull/36664), [SGLang PR 39724](https://github.com/sgl-project/sglang/pull/39724).

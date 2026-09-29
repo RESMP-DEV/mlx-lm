@@ -1,0 +1,18 @@
+Research is complete, but the required output file could not be written.
+
+**Blocker:** the sandbox is read-only and approval is `never`. I attempted to create `/tmp/qwen38_flash_next_research.md`, but the patch tool rejected it with:
+
+`writing is blocked by read-only sandbox; rejected by user approval settings`
+
+No files were changed in `/Users/kearm/mlx-lm`.
+
+Key findings, pending a writable retry:
+
+- GGUF architecture id is `qwen4exp`; PR #28243 adds MTP tensors under synthetic `blk.48.nextn.*`, not a new arch id.
+- Official and Unsloth GGUFs ship the 20M-row n-gram table as `per_layer_token_embd.weight`; Unsloth BF16 shape is `[160, 320001536]`, BF16.
+- Unsloth target GGUFs do not ship MTP tensors. They are in separate `MTP/*.gguf` files using `blk.48.nextn.*`.
+- Shared MTP drafts omit `token_embd.weight` and `output.weight` and set `qwen4exp.nextn_shared_target_tensors=true`; self-contained drafts include both.
+- Main-context state requires synchronized full-attention KV, F32 GDN conv/state, QSA indexer cache, and PLE hash/conv history.
+- Important traps: per-stream MTP combiner input, dense MTP attention, EOS-based PLE hash reset, QSA Hadamard rotation for quantized KV, atomic auxiliary-cache rollback, 0-based PLE layer mapping, and Mistral.rs’s explicitly unfinished speculative/paged support.
+
+Evidence sources include [llama.cpp PR #28243](https://github.com/ggml-org/llama.cpp/pull/28243), [PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742), [ds4 PR #1115](https://github.com/antirez/ds4/pull/1115), [Mistral.rs PR #2420](https://github.com/EricLBuehler/mistral.rs/pull/2420), [official HF API](https://huggingface.co/api/models/Qwen/Qwen3.8-Flash-Next?blobs=true), and [Unsloth HF API](https://huggingface.co/api/models/unsloth/Qwen3.8-Flash-Next-GGUF?blobs=true).

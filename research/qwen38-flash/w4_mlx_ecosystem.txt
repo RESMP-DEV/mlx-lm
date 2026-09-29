@@ -1,0 +1,117 @@
+The research is complete, but the designated output file could not be written: the session sandbox rejected the single write attempt to `research/qwen38-flash/w4_mlx_ecosystem.txt`, and no escalation path is permitted. No repository file was modified. The full requested report is below.
+
+```markdown
+# MLX ecosystem study: Qwen3.8-Flash-Next / `qwen4_exp`
+
+Scope: MLX ecosystem, existing conversions, GitHub support work, the local mlx-lm baseline, and local MLX core operations.
+
+## Summary
+
+- The three named HF packs all declare `qwen4_exp` / `Qwen4ExpForConditionalGeneration`; none ships `.py` remote-code files. Only ddalcu is an MLX-native serving pack; tcclaviger is vLLM-specific, while Jundot is an MLX affine-quantized pack.
+- A working but unmerged mlx-lm port exists in open PR [#1788](https://github.com/ml-explore/mlx-lm/pull/1788): one text-only model file plus one test, with local generation/batch-parity evidence and one approval. It strips MTP and vision tensors.
+- `mlx-community` has seven Flash-Next MLX conversions, including MTP-bearing 4/6/8-bit and mixed-precision variants. Index inspection confirms n-gram/PLE, indexer, and where present MTP tensors; some quant names overstate a single precision.
+- Production-like MLX support already exists in Blaizzy/mlx-vlm, including merged Qwen4 MTP, external PLE storage, QSA cache/batching, and APC work. jundot/omlx and ddalcu/mlx-serve also have merged MLX-ecosystem implementations, but they are not mlx-lm.
+- Local `qwen3_next` is a hybrid gated-delta-net/full-attention MoE model. Registration is dynamic by `model_type`, so `mlx_lm/models/qwen4_exp.py` is the mandatory registry entry. Conversion and tokenizer wiring are generic unless custom quantization or MTP runtime behavior is added.
+- MLX core already has `cumsum`, `argpartition`, `gather`, and `take_along_axis`. It lacks public chunked-cumsum and generic associative-scan operations; indexed top-k must use `argpartition` plus an indexed gather.
+
+## Findings
+
+1. **ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit** — <https://huggingface.co/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit>. Declares `library_name: mlx-serve`; README launch uses `mlx-serve`. No Python files. It has 101 main safetensors shards, a vision shard, and `ngram_table.bin`; README says the 32 GB `.bin` is a safetensors-format PLE table intentionally outside normal MLX loading. Config/index and README show MTP, indexer, and n-gram metadata/tensors.
+2. **tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ** — <https://huggingface.co/tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ>. Declares `library_name: transformers`; no Python files. README/config target a custom `tcclaviger/vllm:latest` Docker image. Compressed-tensors MXFP4 Linear groups are combined with FP8 attention/GDN weights and FP8 activations; README separately identifies FP8 MTP and INT6 PLE.
+3. **Jundot/Qwen3.8-Flash-Next-oQ4e-mtp** — <https://huggingface.co/Jundot/Qwen3.8-Flash-Next-oQ4e-mtp>. Declares `library_name: mlx`; README identifies oMLX/oQ 0.6.3rc3. No Python files. Default affine quant is 4-bit/64, with 631 per-module affine entries: 4-bit 128, 5-bit 181, 6-bit 99, and 8-bit 223.
+4. **mlx-lm PR #1788** — <https://github.com/ml-explore/mlx-lm/pull/1788>. Open, non-draft, author `eauchs`; opened 2026-08-26 and updated 2026-09-26. Changed files are exactly `mlx_lm/models/qwen4_exp.py` and `tests/test_models.py`. It is approved by `BrunoCerberus`, has no recorded status checks, and its PR body reports local generation and `BatchGenerator` parity evidence. The implementation explicitly drops `mtp.*`, `model.visual.*`, `visual.*`, and `vision_tower.*`.
+5. **Core MLX has no `qwen4_exp` PR** — searches of <https://github.com/ml-explore/mlx> for `qwen4`, `qwen3_8`, and `qwen4_exp` found no model-support PR or issue; matches concern performance/Metal behavior only.
+6. **Blaizzy/mlx-vlm has the most complete MLX implementation** — `main` contains `mlx_vlm/models/qwen4_exp/` and `mlx_vlm/speculative/drafters/qwen4_exp_mtp/`. Merged work includes MTP [#2040](https://github.com/Blaizzy/mlx-vlm/pull/2040), external PLE [#2045](https://github.com/Blaizzy/mlx-vlm/pull/2045), adaptive draft depth [#2046](https://github.com/Blaizzy/mlx-vlm/pull/2046), QSA cache/batched parity [#2126](https://github.com/Blaizzy/mlx-vlm/pull/2126), and APC memory profiles [#2272](https://github.com/Blaizzy/mlx-vlm/pull/2272). PR #2028 closed unmerged, but its batched-QSA design is credited by mlx-lm PR #1788.
+7. **Other MLX implementations** — jundot/omlx merged native multimodal support in [#3169](https://github.com/jundot/omlx/pull/3169) with passing Python 3.11–3.13 checks; earlier text/MTP PRs #3161/#3163 closed unmerged. ddalcu/mlx-serve has merged Qwen4 YaRN and GDN/MTP performance work (#323, #517). [`jjang-ai/vmlx`](https://github.com/jjang-ai/vmlx/tree/main/vmlx_engine/models/qwen4_exp) adds an mlx-vlm `qwen4_exp` loader/register wrapper and SSD-backed PLE support, but depends on mlx-vlm.
+8. **Port surface** — `/Users/kearm/mlx-lm/mlx_lm/utils.py:198-224` dynamically imports `mlx_lm.models.{model_type}`; `/Users/kearm/mlx-lm/mlx_lm/models/__init__.py` has no static registry. A filename matching `model_type` is mandatory.
+9. **MLX core primitives** — cumulative scans and indexed selection exist in `/Users/kearm/mlx/mlx/ops.cpp` and `/Users/kearm/mlx/python/src/ops.cpp`; no public generic associative scan or named chunked cumsum was found.
+
+## Existing MLX conversions inventory
+
+Counts are matching safetensors-index keys, not unique semantic modules.
+
+| Repo | Arch string | Runtime | Quants | Custom code | n-gram / MTP / indexer weights |
+|---|---|---|---|---|---|
+| `ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit` | `qwen4_exp`, `Qwen4ExpForConditionalGeneration` | mlx-serve 26.8.11 | Default 4-bit/64 affine; README policy uses 4-bit experts/embeddings/PLE, 8-bit attention/GDN/hyper-connections/indexer/shared experts/head, BF16 routers/norms/convs/SSM | None shipped; converter named in mlx-serve repo | External PLE + two metadata keys / yes, 72 / yes, 65 |
+| `tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ` | `qwen4_exp`, `Qwen4ExpForConditionalGeneration` | custom vLLM Docker image | Compressed-tensors MXFP4 group 32; FP8 attention/GDN weights and FP8 activations; README adds FP8 MTP, INT6 PLE, FP8 KV scales | None shipped | Yes, 258 / yes, 4,650 / yes, 39 |
+| `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp` | `qwen4_exp`, `Qwen4ExpForConditionalGeneration` | MLX format; oMLX/oQ converter | Affine default 4-bit/64 with 631 per-module overrides: 4-bit 128, 5-bit 181, 6-bit 99, 8-bit 223 | None shipped | Yes, 387 / yes, 76 / yes, 65 |
+| `mlx-community/Qwen3.8-Flash-Next-4bit` | `qwen4_exp`, `Qwen4ExpForConditionalGeneration` | generic MLX | 4-bit/32 affine | None | Yes, 386 / no / yes, 60 |
+| `mlx-community/Qwen3.8-Flash-Next-4bit-mtp` | `qwen4_exp`, `Qwen4ExpForConditionalGeneration` | generic MLX | 4-bit/32 affine | None | Yes, 386 / yes, 54 / yes, 63 |
+| `mlx-community/Qwen3.8-Flash-Next-oQ6e-mtp` | `qwen4_exp`, `Qwen4ExpForConditionalGeneration` | generic MLX / oQ | Affine default 6-bit/64 with 383 module overrides: 6-bit 164, 8-bit 219 | None | Yes, 387 / yes, 76 / yes, 65 |
+| `mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp` | `qwen4_exp`, `Qwen4ExpForConditionalGeneration` | generic MLX / oQ | Affine default 8-bit/64 with 451 module overrides, all 8-bit | None | Yes, 387 / yes, 76 / yes, 65 |
+| `mlx-community/Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp` | `qwen4_exp`, `Qwen4ExpForConditionalGeneration` | generic MLX / oQ; uncensored base | Affine default 5-bit/64 with 871 overrides: 5-bit 164, 6-bit 498, 8-bit 209 | None | Yes, 387 / yes, 76 / yes, 65 |
+| `mlx-community/Qwen3.8-Flash-Next-Uncensored-oQ6e-mtp` | `qwen4_exp`, `Qwen4ExpForConditionalGeneration` | generic MLX / oQ; uncensored base | Affine default 6-bit/64 with 383 overrides: 6-bit 164, 8-bit 219 | None | Yes, 387 / yes, 76 / yes, 65 |
+| `mlx-community/Qwen3.8-Flash-Next-OptiQ-2bit` | `qwen4_exp`, `Qwen4ExpForConditionalGeneration` | generic MLX / OptiQ | Default 4-bit/64 affine plus 950 module overrides: 2-bit 111, 4-bit 549, 8-bit 290; mixed, not globally 2-bit | None | Yes, 386 / no / yes, 60 |
+
+## `qwen3_next` baseline structure and mlx-lm registry wiring
+
+Source: `/Users/kearm/mlx-lm/mlx_lm/models/qwen3_next.py`, 525 lines.
+
+### Structure
+
+- `ModelArgs` is a flat dataclass for hidden dimensions, full-attention interval, GDN geometry, MoE geometry, rope, and tied embeddings.
+- `Qwen3NextRMSNormGated` uses `mx.fast.rms_norm`; gated output uses `precise_swiglu`.
+- `Qwen3NextAttention` uses fused Q plus a sigmoid gate, separate K/V, `nn.RMSNorm`, `initialize_rope`, `KVCache.update_and_fetch`, and `scaled_dot_product_attention`.
+- `Qwen3NextGatedDeltaNet` projects/reorders QKVZ and BA, keeps depthwise `nn.Conv1d` state in cache slot 0, normalizes Q/K through `gated_delta.normalize_qk`, calls `gated_delta_update`, stores SSM state in slot 1, and calls `cache.advance(S)`.
+- `gated_delta_update` computes decay with `mx.exp`, `nn.softplus`, and `mx.sigmoid`. On GPU it dispatches custom `mx.fast.metal_kernel` implementations. The CPU/fallback path, `gated_delta_ops`, loops over `_gated_delta_step_ops`; that step uses elementwise multiply/add, reductions over the key dimension, `mx.where`, and `mx.stack`.
+- `Qwen3NextSparseMoeBlock` uses precise softmax, `mx.argpartition`, `mx.take_along_axis`, `SwitchGLU`, a dense shared expert, and a sigmoid shared-expert gate.
+- `Qwen3NextDecoderLayer` chooses GDN when `(layer_idx + 1) % full_attention_interval != 0`, otherwise full attention. MLP choice follows `decoder_sparse_step` and `mlp_only_layers`.
+- `Qwen3NextModel(PipelineMixin, nn.Module)` owns embeddings, layers, final norm, pipeline communication, one SSM mask, and one full-attention mask.
+- Top-level `Model` owns the text model and optional untied `lm_head`.
+
+### Cache
+
+- `Model.make_cache()` returns `ArraysCache(size=2)` for linear layers and `KVCache()` for full-attention layers (`qwen3_next.py:477-478`).
+- Linear cache slot 0 is GDN convolution state; slot 1 is recurrent SSM state.
+- `ArraysCache` serializes `[cache, left_padding, lengths]` and implements filter/extend/extract/merge in `/Users/kearm/mlx-lm/mlx_lm/models/cache.py:596-726`. PR #1788 defines model-local `_AttnCache`, `_BatchAttnCache`, `_IndexerCache`, and `_LayerCache` instead of modifying core cache.py.
+
+### Quantization and MTP hooks
+
+- `Model.sanitize()` discovers MoE layers, removes keys containing `mtp.` (`qwen3_next.py:489`), stacks expert projections into `switch_mlp`, transposes conv weights, and adds 1.0 to selected zero-centered norms.
+- `Model.quant_predicate` requests 8-bit/64 only for `mlp.gate` and `shared_expert_gate`.
+- `/Users/kearm/mlx-lm/mlx_lm/utils.py:474-535` calls `sanitize()` before applying external/per-module quantization.
+- `/Users/kearm/mlx-lm/mlx_lm/utils.py:936-1004` invokes `model.quant_predicate` during `quantize_model`.
+
+### Exact port touchpoints
+
+1. **Required:** create `/Users/kearm/mlx-lm/mlx_lm/models/qwen4_exp.py` with exported `Model` and `ModelArgs`. Dynamic import is the registry.
+2. **Optional:** `/Users/kearm/mlx-lm/mlx_lm/utils.py`
+   - `MODEL_REMAPPING` only to alias another `model_type`.
+   - `MODEL_ARCHITECTURE_REMAPPING` only for `(model_type, architecture)` aliasing.
+   - Literal `qwen4_exp` needs no mapping edit.
+3. **No static registry edit:** `/Users/kearm/mlx-lm/mlx_lm/models/__init__.py` is empty of a model map.
+4. **Tokenizer:** normally no change. `/Users/kearm/mlx-lm/mlx_lm/tokenizer_utils.py` and `/Users/kearm/mlx-lm/mlx_lm/utils.py:574-596` use HF `AutoTokenizer` and infer streaming detokenization.
+5. **Conversion:** normally no change to `/Users/kearm/mlx-lm/mlx_lm/convert.py`. Handle model-specific packing or quantization through `sanitize()`, `quant_predicate`, or `cast_predicate`.
+6. **MTP:** no current baseline support. `/Users/kearm/mlx-lm/mlx_lm/generate.py:476-659` supports only an external `draft_model`; it cannot directly use an in-checkpoint `mtp.*` head. Native MTP requires a drafter/verifier API and cache lifecycle, extraction into a separately loadable draft model, or an mlx-vlm-style splitter. CLI/server work would be required for user-selectable native MTP.
+7. **Tests:** `/Users/kearm/mlx-lm/tests/test_models.py` should cover construction, cache trim/merge, sanitize idempotence/norm convention, and MTP if implemented.
+8. **Vision:** a text-only mlx-lm port should strip vision tensors; multimodal work is separate.
+
+## MLX core op availability
+
+Reference: `/Users/kearm/mlx/mlx`, clean `main` at `53aa45667`. Runtime import could not probe live Metal because this sandbox has no Metal device; conclusions use source and bindings.
+
+| Needed primitive | Status | Evidence and implication |
+|---|---|---|
+| Cumulative sum | Present | `mx.cumsum` at `/Users/kearm/mlx/mlx/ops.cpp:4161`, Python binding at `/Users/kearm/mlx/python/src/ops.cpp:3645`; Metal scan kernels in `/Users/kearm/mlx/mlx/backend/metal/kernels/scan.h` and `scan.metal`. |
+| Chunked cumsum | No named public op | Implement by reshaping chunks, using `mx.cumsum`/sum, and adding carries, or add a core/fast primitive. |
+| Generic associative scan | Missing | No `associative_scan` public op or Python binding found. Metal scan kernels are specialized CumSum/CumProd/CumMax, not a user callback. |
+| Top-k values | Present | `mx.topk` at `/Users/kearm/mlx/mlx/ops.cpp:2930`, binding at `/Users/kearm/mlx/python/src/ops.cpp:3216`; returns values, not indices. |
+| Top-k indices | Usable via `argpartition` | `mx.argpartition` at `/Users/kearm/mlx/mlx/ops.cpp:2868`, binding at `/Users/kearm/mlx/python/src/ops.cpp:3143`; combine with masking and `take_along_axis`. |
+| Sequence gather | Present | `mx.gather` at `/Users/kearm/mlx/mlx/ops.cpp:3568`; `mx.take_along_axis` at `/Users/kearm/mlx/mlx/ops.cpp:3765`. |
+| Indexed scatter | Present | `mx.put_along_axis` at `/Users/kearm/mlx/mlx/ops.cpp:3838`; PR #1788 uses it for masks and row-sharded PLE assembly. |
+
+## Open questions
+
+1. Should the fork track mlx-lm PR #1788, adapt the more complete mlx-vlm implementation, or wait for #1788 review to settle norm/QSA/cache conventions?
+2. What is the target MTP contract for mlx-lm: external draft model, extracted in-checkpoint drafter, or native same-checkpoint verifier loop?
+3. Should PLE stay in safetensors, use external SSD-backed storage, or be stripped in the first milestone?
+4. Which checkpoint is the acceptance artifact? PR #1788 warns that pre-`ac83bb4` conversions can have incompatible unbaked RMSNorm conventions.
+5. Is vision required initially, or should the port remain text-only?
+6. Is a new MLX core/fast kernel needed, or do `argpartition`, `take_along_axis`, `mx.compile`, and custom Metal kernels meet the performance target?
+
+## Validation and delivery status
+
+- Completed: HF API/config/index/README inspection, GitHub PR/issue/code searches, local mlx-lm source inspection, and local MLX source inspection.
+- No tests were run; this task was research only. GitHub check evidence is reported as found, not independently rerun.
+- Not completed: writing `research/qwen38-flash/w4_mlx_ecosystem.txt`. The sole write attempt was rejected by the read-only sandbox. The file remained unchanged.
+```
