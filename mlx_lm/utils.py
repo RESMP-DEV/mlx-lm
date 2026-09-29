@@ -56,6 +56,7 @@ MODEL_REMAPPING = {
     "iquestcoder": "llama",
     "xverse": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+    "qwen4_exp_text": "qwen4_exp",  # transformers text-model type; the port handles the wrapper config
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {

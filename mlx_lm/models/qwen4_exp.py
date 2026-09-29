@@ -1113,11 +1113,16 @@ class Model(nn.Module):
     )
 
     def sanitize(self, weights):
-        # Fold the reference's `1 +` into the weight here instead of at every call. Gated on
-        # the HF layout, because sanitize also runs on load: a checkpoint converted by this
-        # file comes back as `model.*`, matches nothing below, and must not be folded twice.
-        # Checkpoints from other MLX converters already carry the folded value.
-        fold = any(k.startswith("model.language_model.") for k in weights)
+        # Fold the reference's `1 +` into the weight here instead of at every call.
+        # transformers saves the wrapper's text tower under `model.language_model.`,
+        # the mlx-vlm converter preserves the nested `language_model.` spelling
+        # (values verified still zero-centered there); both must fold. Only a
+        # checkpoint saved from this file comes back flat as `model.*` with the
+        # fold already applied, so it must not be folded twice.
+        fold = any(
+            k.startswith(("model.language_model.", "language_model."))
+            for k in weights
+        )
 
         out = {}
         per_expert: dict = {}
