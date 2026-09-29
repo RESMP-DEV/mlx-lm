@@ -144,3 +144,6 @@ dmypy.json
 # Local agent/index state
 .sindexer/
 .worktrees/
+
+# Local reference verification env
+.venv-ref/

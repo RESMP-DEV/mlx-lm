@@ -1,0 +1,5 @@
+tiny-*/
+*.npz
+*-prompts.json
+prompts.json
+__pycache__/
