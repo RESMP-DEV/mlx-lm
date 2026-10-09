@@ -20,6 +20,53 @@ from mlx_lm.utils import (
     save,
 )
 
+MODE_DEFAULTS = {
+    "affine": (64, 4),
+    "mxfp4": (32, 4),
+    "mxfp8": (32, 8),
+    "nvfp4": (16, 4),
+}
+
+
+def _quant_dequant(w, bits, group_size, mode):
+    w_q, scales, *biases = mx.quantize(w, bits=bits, group_size=group_size, mode=mode)
+    return mx.dequantize(
+        w_q,
+        scales=scales,
+        biases=biases[0] if biases else None,
+        bits=bits,
+        group_size=group_size,
+        mode=mode,
+    )
+
+
+def _can_quantize(module, low_group_size, high_group_size, low_mode, high_mode):
+    if not hasattr(module, "weight") or not hasattr(module, "to_quantized"):
+        return False
+    if isinstance(module, nn.Embedding):
+        return False
+    weight = module.weight
+    if weight.ndim != 2:
+        return False
+    group_sizes = (
+        {low_group_size} if low_mode == high_mode else {low_group_size, high_group_size}
+    )
+    return all(weight.shape[-1] % group_size == 0 for group_size in group_sizes)
+
+
+def _resolve_quant_params(mode, bits, group_size, default_bits, default_group_size):
+    mode_group_size, mode_bits = MODE_DEFAULTS[mode]
+    if bits is None:
+        bits = default_bits if mode == "affine" else mode_bits
+    if group_size is None:
+        group_size = default_group_size if mode == "affine" else mode_group_size
+    required = (mode_bits, mode_group_size)
+    if mode != "affine" and (bits, group_size) != required:
+        raise ValueError(
+            f"{mode} requires bits={required[0]} and group_size={required[1]}"
+        )
+    return bits, group_size
+
 
 def eval_ppl(model, data, batch_size=8):
     all_loss = 0.0
@@ -41,20 +88,25 @@ def estimate_sensitivities(
     low_group_size,
     high_bits,
     high_group_size,
+    low_mode="affine",
+    high_mode="affine",
     batch_size: int = 4,
     gradient_accum_dtype: mx.Dtype = mx.float32,
     gradient_checkpoint: bool = False,
 ):
-    def qdq(w, bits, group_size):
-        w, s, b = mx.quantize(w, bits=bits, group_size=group_size)
-        return mx.dequantize(w, scales=s, biases=b, bits=bits, group_size=group_size)
-
     layers = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
-    layers = {k: l for k, l in layers if hasattr(l, "to_quantized")}
+    layers = {
+        k: l
+        for k, l in layers
+        if _can_quantize(l, low_group_size, high_group_size, low_mode, high_mode)
+    }
+    if not layers:
+        return []
+
     q_model = copy.deepcopy(model)
     q_layers = copy.deepcopy(layers)
     for l in q_layers.values():
-        l.weight = qdq(l.weight, low_bits, low_group_size)
+        l.weight = _quant_dequant(l.weight, low_bits, low_group_size, low_mode)
         # Freeze everything but the quantizable weight
         l.freeze()
         l.unfreeze(keys=["weight"])
@@ -87,7 +139,9 @@ def estimate_sensitivities(
     def compute_sensitivity(gradient, low_q_weight, original_weight):
         n_batches = (len(data) + batch_size - 1) // batch_size
         gradient = gradient / n_batches
-        high_q_weight = qdq(original_weight, high_bits, high_group_size)
+        high_q_weight = _quant_dequant(
+            original_weight, high_bits, high_group_size, high_mode
+        )
         param_size = original_weight.size / 1e6
         alignment = (gradient * (low_q_weight - high_q_weight)).sum()
         return alignment / param_size
@@ -113,12 +167,18 @@ def estimate_threshold(
     low_group_size,
     high_bits,
     high_group_size,
+    low_mode="affine",
+    high_mode="affine",
 ):
     def predicate(p, m, high_threshold):
-        if not hasattr(m, "to_quantized"):
+        if not _can_quantize(m, low_group_size, high_group_size, low_mode, high_mode):
             return False
         if sensitivities[p] > high_threshold:
-            return {"bits": high_bits, "group_size": high_group_size}
+            return {
+                "bits": high_bits,
+                "group_size": high_group_size,
+                "mode": high_mode,
+            }
         return True
 
     # Binary search for the threshold
@@ -134,6 +194,7 @@ def estimate_threshold(
             q_model,
             group_size=low_group_size,
             bits=low_bits,
+            mode=low_mode,
             class_predicate=class_predicate,
         )
         bpw = compute_bits_per_weight(q_model)
@@ -161,10 +222,25 @@ def main():
     parser.add_argument(
         "--target-bpw", type=float, default=5.0, help="Target bits per weight."
     )
-    parser.add_argument("--low-bits", type=int, default=4)
-    parser.add_argument("--low-group-size", type=int, default=64)
-    parser.add_argument("--high-bits", type=int, default=5)
-    parser.add_argument("--high-group-size", type=int, default=64)
+    parser.add_argument("--low-bits", type=int, default=None)
+    parser.add_argument("--low-group-size", type=int, default=None)
+    parser.add_argument("--high-bits", type=int, default=None)
+    parser.add_argument("--high-group-size", type=int, default=None)
+    parser.add_argument(
+        "--low-mode",
+        choices=tuple(MODE_DEFAULTS),
+        default="affine",
+    )
+    parser.add_argument(
+        "--high-mode",
+        choices=tuple(MODE_DEFAULTS),
+        default="affine",
+    )
+    parser.add_argument(
+        "--mxfp4",
+        action="store_true",
+        help="use MXFP8 for sensitive layers and MXFP4 for the rest",
+    )
     parser.add_argument(
         "--report-ppl",
         action="store_true",
@@ -188,6 +264,39 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.mxfp4:
+        args.low_mode = "mxfp4"
+        args.high_mode = "mxfp8"
+        args.low_bits = None
+        args.low_group_size = None
+        args.high_bits = None
+        args.high_group_size = None
+
+    try:
+        args.low_bits, args.low_group_size = _resolve_quant_params(
+            args.low_mode,
+            args.low_bits,
+            args.low_group_size,
+            default_bits=4,
+            default_group_size=64,
+        )
+        args.high_bits, args.high_group_size = _resolve_quant_params(
+            args.high_mode,
+            args.high_bits,
+            args.high_group_size,
+            default_bits=5,
+            default_group_size=64,
+        )
+    except ValueError as e:
+        parser.error(str(e))
+
+    if (args.low_mode, args.low_bits, args.low_group_size) == (
+        args.high_mode,
+        args.high_bits,
+        args.high_group_size,
+    ):
+        parser.error("low and high quantization settings must differ")
+
     mx.distributed.init()
     model, tokenizer, config = load(
         args.model,
@@ -206,6 +315,8 @@ def main():
             args.low_group_size,
             args.high_bits,
             args.high_group_size,
+            args.low_mode,
+            args.high_mode,
             gradient_accum_dtype=getattr(mx, args.accumulation_dtype),
             gradient_checkpoint=args.grad_checkpoint,
         )
@@ -232,13 +343,25 @@ def main():
         low_group_size=args.low_group_size,
         high_bits=args.high_bits,
         high_group_size=args.high_group_size,
+        low_mode=args.low_mode,
+        high_mode=args.high_mode,
     )
 
     def quant_predicate(p, m):
-        if not hasattr(m, "to_quantized"):
+        if not _can_quantize(
+            m,
+            args.low_group_size,
+            args.high_group_size,
+            args.low_mode,
+            args.high_mode,
+        ):
             return False
         if sensitivities[p] > threshold:
-            return {"bits": args.high_bits, "group_size": args.high_group_size}
+            return {
+                "bits": args.high_bits,
+                "group_size": args.high_group_size,
+                "mode": args.high_mode,
+            }
         return True
 
     model, config = quantize_model(
@@ -246,6 +369,7 @@ def main():
         config,
         group_size=args.low_group_size,
         bits=args.low_bits,
+        mode=args.low_mode,
         quant_predicate=quant_predicate,
     )
 
