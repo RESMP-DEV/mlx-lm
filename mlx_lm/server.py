@@ -40,7 +40,7 @@ from .generate import (
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
-from .sample_utils import make_logits_processors, make_sampler
+from .sample_utils import greedy_sampler, make_logits_processors, make_sampler
 from .utils import (
     _parse_size,
     load,
@@ -440,6 +440,8 @@ class ResponseGenerator:
         self._rank = mx.distributed.init().rank()
         self._stop = False
         self._generation_failed = False
+        self._last_gpu_activity: Optional[float] = None
+        self._idle_warmup_count = 0
         self._generation_thread = Thread(target=self._run_generate)
         self._generation_thread.start()
 
@@ -652,6 +654,33 @@ class ResponseGenerator:
             and self.cli_args.kv_bits is None
         )
 
+    def _run_idle_warmup(self, batch_generator, tokenizer):
+        """Run one cold token before an idle-time user request."""
+        prompt = tokenizer.encode(self.cli_args.idle_warmup_prompt)
+        (uid,) = batch_generator.insert(
+            [prompt],
+            max_tokens=[1],
+            all_tokens=[[]],
+            samplers=[greedy_sampler],
+            logits_processors=[[]],
+        )
+        finished = False
+        for _ in self._time_budget:
+            prompt_responses, gen_responses = batch_generator.next()
+            finished = any(
+                response.finish_reason is not None
+                for response in gen_responses
+                if response.uid == uid
+            )
+            if finished:
+                break
+        if not finished:
+            logging.warning("Idle warm-up did not finish within its time budget")
+        batch_generator.remove([uid])
+        self._idle_warmup_count += 1
+        logging.debug("Idle warm-up completed")
+        self._last_gpu_activity = time.monotonic()
+
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
         # sure that all generation runs in the same stream as the
@@ -667,6 +696,7 @@ class ResponseGenerator:
         batch_generator = None
         drain_batch = False
         batch_results = {}
+        idle_warmup_seconds = getattr(self.cli_args, "idle_warmup_seconds", None)
 
         unprocessed_requests = []
 
@@ -811,6 +841,14 @@ class ResponseGenerator:
                         batch_generator.close()
                         batch_generator = None
                         drain_batch = False
+                    elif (
+                        idle_warmup_seconds
+                        and self._last_gpu_activity is not None
+                        and time.monotonic() - self._last_gpu_activity
+                        >= idle_warmup_seconds
+                    ):
+                        self._run_idle_warmup(batch_generator, current_tokenizer)
+                        continue
                     continue
 
                 uids_to_remove = []
@@ -843,6 +881,9 @@ class ResponseGenerator:
                             cache_type=batch_results[uid]["segment_types"].pop(),
                         )
                     del caches
+
+                    if prompt_responses or gen_responses:
+                        self._last_gpu_activity = time.monotonic()
 
                     for r in gen_responses:
                         result = batch_results[r.uid]
@@ -1889,6 +1930,18 @@ def main():
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--idle-warmup-seconds",
+        type=float,
+        default=None,
+        help="Run one background token before a request after this idle period",
+    )
+    parser.add_argument(
+        "--idle-warmup-prompt",
+        type=str,
+        default="The quick brown fox jumps over the lazy dog.",
+        help="Prompt for idle warm-up (default: a short English sentence)",
     )
     parser.add_argument(
         "--prompt-cache-size",

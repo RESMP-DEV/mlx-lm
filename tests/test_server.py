@@ -20,6 +20,7 @@ from mlx_lm.server import (
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
+    TimeBudget,
     _make_sampler,
 )
 from mlx_lm.tool_parsers import pythonic
@@ -904,6 +905,44 @@ class TestModelSwapClearsCache(unittest.TestCase):
         provider._load("model-a")
         provider._load("model-b")
         self.assertGreaterEqual(clear_cache.call_count, 2)
+
+
+class TestIdleWarmup(unittest.TestCase):
+    def test_runs_one_token_and_removes_it(self):
+        class FakeResponse:
+            uid = 7
+            finish_reason = "length"
+
+        class FakeBatchGenerator:
+            insert_args = None
+            removed = None
+
+            def insert(self, prompts, **kwargs):
+                self.insert_args = (prompts, kwargs)
+                return [7]
+
+            def next(self):
+                return [], [FakeResponse()]
+
+            def remove(self, uids):
+                self.removed = uids
+
+        cli_args = mock.Mock(idle_warmup_prompt="warm")
+        provider = mock.Mock(cli_args=cli_args)
+        generator = ResponseGenerator(provider, LRUPromptCache())
+        generator._time_budget = TimeBudget()
+        batch = FakeBatchGenerator()
+
+        try:
+            generator._run_idle_warmup(batch, mock.Mock(encode=lambda value: [1, 2, 3]))
+        finally:
+            generator.stop_and_join()
+
+        prompts, options = batch.insert_args
+        self.assertEqual(prompts, [[1, 2, 3]])
+        self.assertEqual(options["max_tokens"], [1])
+        self.assertEqual(batch.removed, [7])
+        self.assertEqual(generator._idle_warmup_count, 1)
 
 
 class FailingModelProvider:
