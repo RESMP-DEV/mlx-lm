@@ -317,6 +317,7 @@ def generate_step(
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    greedy_fast: bool = False,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -382,6 +383,8 @@ def generate_step(
     )
 
     sampler = sampler or greedy_sampler
+    if greedy_fast and sampler is not greedy_sampler:
+        raise ValueError("greedy_fast requires the default greedy sampler")
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
@@ -415,6 +418,9 @@ def generate_step(
 
             quantize_cache_fn(prompt_cache)
 
+            if greedy_fast:
+                sampled = mx.argmax(logits, axis=-1)
+                return sampled, logits.squeeze(0)
             logprobs = logits - mx.logsumexp(logits, keepdims=True)
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
@@ -423,6 +429,9 @@ def generate_step(
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
+        prepare_prompt = getattr(model, "prepare_prompt_tokens", None)
+        if callable(prepare_prompt):
+            prepare_prompt(total_prompt_tokens)
         prompt_processed_tokens = 0
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
         while total_prompt_tokens - prompt_processed_tokens > 1:
@@ -533,7 +542,7 @@ def speculative_generate_step(
     if not can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+            f"Speculative decoding requires a trimmable prompt cache (got {types})."
         )
 
     sampler = sampler or greedy_sampler
@@ -2113,6 +2122,7 @@ def main():
         max_tokens=args.max_tokens,
         verbose=args.verbose,
         sampler=sampler,
+        greedy_fast=args.temp == 0,
         max_kv_size=args.max_kv_size,
         prefill_step_size=args.prefill_step_size,
         prompt_cache=prompt_cache if using_cache else None,
