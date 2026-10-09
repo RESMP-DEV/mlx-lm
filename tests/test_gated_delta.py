@@ -95,6 +95,18 @@ class TestGatedDelta(unittest.TestCase):
         self.assertLess(_rel_l2(y_p, y_r), 2e-3)
         self.assertLess(_rel_l2(s_p, s_r), 2e-3)
 
+    def test_packed_t1_matches_packed_kernel(self):
+        if mx.default_device() != mx.gpu:
+            raise unittest.SkipTest("gated delta kernels are GPU only")
+
+        args = self._inputs(1, 1, 16, 48, 128, 128, mx.bfloat16)
+        y_p, s_p = gated_delta_kernel(*args, None)
+        y_t, s_t = gated_delta_kernel(*args, None, allow_packed_t1=True)
+        mx.eval(y_p, s_p, y_t, s_t)
+
+        self.assertTrue(mx.array_equal(y_p, y_t))
+        self.assertTrue(mx.array_equal(s_p, s_t))
+
     def test_explicit_tree_matches_simd_sum_kernel(self):
         # On all current Apple GPUs simd_sum lowers to the same ascending
         # butterfly the comparator writes out, so the packed kernel is also

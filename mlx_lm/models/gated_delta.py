@@ -381,6 +381,95 @@ _gated_delta_kernel_xtree = _make_gated_delta_kernel_xtree()
 _gated_delta_kernel_packed = _make_gated_delta_packed_kernel()
 
 
+def _make_gated_delta_packed_t1_kernel():
+    """Make the packed recurrence with the token loop specialized to one."""
+    if not mx.metal.is_available():
+        return None
+    source = r"""
+        constexpr int lanes_per_row = 4;
+        constexpr int rows_per_simdgroup = 32 / lanes_per_row;
+        constexpr int values_per_lane = Dk / lanes_per_row;
+        constexpr int partials_per_lane = values_per_lane / 4;
+
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        auto lane = thread_index_in_simdgroup;
+        auto row_in_simdgroup = lane / lanes_per_row;
+        auto lane_in_row = lane & (lanes_per_row - 1);
+        auto dv_idx = thread_position_in_grid.y * rows_per_simdgroup +
+            row_in_simdgroup;
+
+        auto q_ = q + (b_idx * Hk + hk_idx) * Dk +
+            lane_in_row * values_per_lane;
+        auto k_ = k + (b_idx * Hk + hk_idx) * Dk +
+            lane_in_row * values_per_lane;
+        auto v_ = v + (b_idx * Hv + hv_idx) * Dv;
+        y += (b_idx * Hv + hv_idx) * Dv;
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk +
+            lane_in_row * values_per_lane;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk +
+            lane_in_row * values_per_lane;
+
+        float state[values_per_lane];
+        for (int i = 0; i < values_per_lane; ++i) {
+          state[i] = static_cast<float>(i_state[i]);
+        }
+        auto g_ = g + b_idx * Hv;
+        auto beta_ = beta + b_idx * Hv;
+        float gt = static_cast<float>(g_[hv_idx]);
+
+        float part[partials_per_lane];
+        for (int pb = 0; pb < partials_per_lane; ++pb) {
+          float acc = 0.0f;
+          for (int i = 0; i < 4; ++i) {
+            int e = pb * 4 + i;
+            state[e] = state[e] * gt;
+            acc += state[e] * static_cast<float>(k_[e]);
+          }
+          part[pb] = acc;
+        }
+        float kv_mem =
+            ((part[0] + part[1]) + (part[2] + part[3])) +
+            ((part[4] + part[5]) + (part[6] + part[7]));
+        kv_mem += simd_shuffle_xor(kv_mem, 1);
+        kv_mem += simd_shuffle_xor(kv_mem, 2);
+        auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) *
+            static_cast<float>(beta_[hv_idx]);
+
+        for (int pb = 0; pb < partials_per_lane; ++pb) {
+          float acc = 0.0f;
+          for (int i = 0; i < 4; ++i) {
+            int e = pb * 4 + i;
+            state[e] = state[e] + static_cast<float>(k_[e]) * delta;
+            acc += state[e] * static_cast<float>(q_[e]);
+          }
+          part[pb] = acc;
+        }
+        float out =
+            ((part[0] + part[1]) + (part[2] + part[3])) +
+            ((part[4] + part[5]) + (part[6] + part[7]));
+        out += simd_shuffle_xor(out, 1);
+        out += simd_shuffle_xor(out, 2);
+        if (lane_in_row == 0) {
+          y[dv_idx] = static_cast<InT>(out);
+        }
+        for (int i = 0; i < values_per_lane; ++i) {
+          o_state[i] = static_cast<StT>(state[i]);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="gated_delta_step_packed_btree_t1",
+        input_names=["q", "k", "v", "g", "beta", "state_in"],
+        output_names=["y", "state_out"],
+        source=source,
+    )
+
+
+_gated_delta_kernel_packed_t1 = _make_gated_delta_packed_t1_kernel()
+
+
 @mx.compile
 def _gated_delta_step_ops(
     q: mx.array,
@@ -436,6 +525,7 @@ def _gated_delta_kernel_impl(
     mask: Optional[mx.array] = None,
     *,
     allow_packed: bool,
+    allow_packed_t1: bool = False,
 ) -> Tuple[mx.array, mx.array]:
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
@@ -455,7 +545,18 @@ def _gated_delta_kernel_impl(
         and state.dtype == mx.float32
     )
 
-    if packed_eligible and allow_packed and _ENABLE_GDN_PACKED:
+    if (
+        packed_eligible
+        and T == 1
+        and allow_packed
+        and allow_packed_t1
+        and _gated_delta_kernel_packed_t1 is not None
+    ):
+        kernel = _gated_delta_kernel_packed_t1
+        inputs = [q, k, v, g, beta, state]
+        grid = (32, Dv // 8, B * Hv)
+        threadgroup = (32, 2, 1)
+    elif packed_eligible and allow_packed and _ENABLE_GDN_PACKED:
         kernel = _gated_delta_kernel_packed
         inputs = [q, k, v, g, beta, state, T]
         grid = (32, Dv // 8, B * Hv)
@@ -550,8 +651,19 @@ def gated_delta_kernel(
     beta: mx.array,
     state: mx.array,
     mask: Optional[mx.array] = None,
+    allow_packed_t1: bool = False,
 ) -> Tuple[mx.array, mx.array]:
-    return _gated_delta_kernel_impl(q, k, v, g, beta, state, mask, allow_packed=True)
+    return _gated_delta_kernel_impl(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        mask,
+        allow_packed=True,
+        allow_packed_t1=allow_packed_t1,
+    )
 
 
 def gated_delta_ops(
@@ -614,6 +726,7 @@ def gated_delta_update(
     mask: Optional[mx.array] = None,
     *,
     use_kernel: bool = True,
+    allow_packed_t1: bool = False,
     lower_bound: float | None = None,
     allow_neg_eigval: bool = False,
 ) -> Tuple[mx.array, mx.array]:
@@ -644,4 +757,6 @@ def gated_delta_update(
         or k.shape[-1] % 32 != 0
     ):
         return gated_delta_ops(q, k, v, g, beta, state, mask)
-    return gated_delta_kernel(q, k, v, g, beta, state, mask)
+    return gated_delta_kernel(
+        q, k, v, g, beta, state, mask, allow_packed_t1=allow_packed_t1
+    )
