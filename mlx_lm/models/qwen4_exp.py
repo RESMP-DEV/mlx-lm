@@ -21,7 +21,14 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import ArraysCache, BatchKVCache, KVCache, _BaseCache, dynamic_roll
+from .cache import (
+    ArraysCache,
+    BatchKVCache,
+    KVCache,
+    _BaseCache,
+    dynamic_roll,
+    register_cache_class,
+)
 from .gated_delta import gated_delta_update, normalize_qk
 from .qwen4_exp_ple import ExternalPleTable
 from .switch_layers import SwitchGLU
@@ -1397,6 +1404,7 @@ class _IndexerCache(_BaseCache):
         self.keys = v if v.size > 0 else None
 
 
+@register_cache_class
 class _AttnCache(KVCache):
     def __init__(self):
         super().__init__()
@@ -1418,6 +1426,13 @@ class _AttnCache(KVCache):
         KVCache.state.fset(self, tuple(kv))
 
     @classmethod
+    def from_state(cls, state):
+        obj = cls.__new__(cls)
+        obj.__init__()
+        obj.state = state
+        return obj
+
+    @classmethod
     def merge(cls, caches):
         return _BatchAttnCache.merge(caches)
 
@@ -1428,6 +1443,7 @@ class _AttnCache(KVCache):
         self.indexer.keys = None
 
 
+@register_cache_class
 class _BatchAttnCache(BatchKVCache):
     """Batched `_AttnCache`. The indexer keys follow the KV padding exactly.
 
@@ -1470,12 +1486,13 @@ class _BatchAttnCache(BatchKVCache):
     def extend(self, other):
         keys, other_keys = self.indexer.keys, other.indexer.keys
         idx, other_idx = self._idx, other._idx
+        other_rows = other.offset.shape[0]
         super().extend(other)
         if keys is None and other_keys is None:
             return
         sample = keys if keys is not None else other_keys
         target = max(idx, other_idx)
-        rows = self.offset.shape[0] - other.offset.shape[0]
+        rows = self.offset.shape[0] - other_rows
 
         # Right-justify both sides on the shared index, like `BatchKVCache`.
         def pad(k, n_rows, used):
@@ -1537,7 +1554,15 @@ class _BatchAttnCache(BatchKVCache):
         *kv, self.indexer.state = v
         BatchKVCache.state.fset(self, tuple(kv))
 
+    @classmethod
+    def from_state(cls, state):
+        obj = cls.__new__(cls)
+        obj.__init__([0] * state[3].size)
+        obj.state = state
+        return obj
 
+
+@register_cache_class
 class _LayerCache(ArraysCache):
     """`ArraysCache` whose slots can stay unused on every row.
 
@@ -1580,6 +1605,19 @@ class _LayerCache(ArraysCache):
         self.cache = [None] * len(self.cache)
         self.left_padding = None
         self.lengths = None
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        return n
+
+    @classmethod
+    def from_state(cls, state):
+        obj = cls.__new__(cls)
+        obj.__init__(len(state[0]))
+        obj.state = state
+        return obj
 
 
 class Model(nn.Module):

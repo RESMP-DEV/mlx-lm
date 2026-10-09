@@ -106,10 +106,31 @@ def load_prompt_cache(file_name, return_metadata=False):
         else:
             raise ValueError(f"[load_prompt_cache] Unknown type {type}")
     arrays = tree_unflatten(list(arrays.items()))
-    cache = [globals()[c].from_state(state) for c, state in zip(classes, arrays)]
+
+    def _resolve(name):
+        # Model-local cache classes are not in this module's namespace.
+        factory = globals().get(name)
+        if factory is not None:
+            return factory
+        for candidate in _CACHE_REGISTRY:
+            if candidate.__name__ == name:
+                return candidate
+        raise ValueError(f"[load_prompt_cache] Unknown cache class {name}")
+
+    cache = [_resolve(c).from_state(state) for c, state in zip(classes, arrays)]
     if return_metadata:
         return cache, metadata
     return cache
+
+
+_CACHE_REGISTRY = []
+
+
+def register_cache_class(cls):
+    """Make a model-local cache class resolvable by `load_prompt_cache`."""
+    if not any(entry.__name__ == cls.__name__ for entry in _CACHE_REGISTRY):
+        _CACHE_REGISTRY.append(cls)
+    return cls
 
 
 def can_trim_prompt_cache(cache: List[Any]) -> bool:

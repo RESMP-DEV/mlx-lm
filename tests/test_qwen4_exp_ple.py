@@ -476,5 +476,54 @@ class TestBatchedPromptCacheReset(unittest.TestCase):
         self.assertTrue(bool(mx.all(cache.offset == 0).item()))
 
 
+class TestHybridBatchExtend(unittest.TestCase):
+    def test_extend_unequal_batches_preserves_rows(self):
+        from mlx_lm.models.qwen4_exp import _BatchAttnCache
+
+        wide = _BatchAttnCache([0, 0])
+        narrow = _BatchAttnCache([0])
+        keys = mx.random.normal((2, 2, 1, 16), dtype=mx.bfloat16)
+        values = mx.random.normal((2, 2, 1, 16), dtype=mx.bfloat16)
+        wide.update_and_fetch(keys, values)
+        wide.indexer.update(mx.random.normal((2, 1, 8), dtype=mx.bfloat16))
+        narrow.update_and_fetch(keys[:1], values[:1])
+        narrow.indexer.update(mx.random.normal((1, 1, 8), dtype=mx.bfloat16))
+
+        wide.extend(narrow)
+
+        self.assertEqual(wide.offset.shape, (3,))
+        self.assertEqual(wide.keys.shape[0], 3)
+        self.assertEqual(wide.values.shape[0], 3)
+        self.assertEqual(wide.indexer.keys.shape[0], 3)
+
+
+class TestHybridCacheSerialization(unittest.TestCase):
+    def test_qwen_cache_classes_round_trip(self):
+        import tempfile
+
+        from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
+        from mlx_lm.models.qwen4_exp import _AttnCache, _LayerCache
+
+        cache = [_AttnCache(), _LayerCache(4)]
+        keys = mx.random.normal((1, 2, 1, 16), dtype=mx.bfloat16)
+        values = mx.random.normal((1, 2, 1, 16), dtype=mx.bfloat16)
+        cache[0].update_and_fetch(keys, values)
+        cache[0].indexer.update(mx.random.normal((1, 1, 8), dtype=mx.bfloat16))
+        cache[1][0] = mx.random.normal((1, 1, 4), dtype=mx.bfloat16)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "qwen-cache.safetensors"
+            save_prompt_cache(path, cache)
+            loaded = load_prompt_cache(path)
+
+        self.assertEqual([type(item) for item in loaded], [_AttnCache, _LayerCache])
+        mx.eval(loaded[0].keys, cache[0].keys)
+        self.assertTrue(bool(mx.array_equal(loaded[0].keys, cache[0].keys).item()))
+        self.assertTrue(
+            bool(mx.array_equal(loaded[0].indexer.keys, cache[0].indexer.keys).item())
+        )
+        self.assertTrue(bool(mx.array_equal(loaded[1][0], cache[1][0]).item()))
+
+
 if __name__ == "__main__":
     unittest.main()
