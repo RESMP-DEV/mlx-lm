@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 # MLX port of Qwen3.8-Flash-Next (HF model_type: qwen4_exp)
 # New compared to qwen3_next: QSA sparse attention, gated residual
 # (hyper-connections), sharded n-gram / PLE embedding, split deltanet projections.
@@ -21,6 +23,7 @@ from .base import (
 )
 from .cache import ArraysCache, BatchKVCache, KVCache, _BaseCache, dynamic_roll
 from .gated_delta import gated_delta_update, normalize_qk
+from .qwen4_exp_ple import ExternalPleTable
 from .switch_layers import SwitchGLU
 
 
@@ -68,10 +71,21 @@ class TextArgs(BaseModelArgs):
     ple_conv_kernel_size: int = 4
     seed: int = 0
     eos_token_id: Any = 248044
+    ple_backend: dict | None = None
     partial_rotary_factor: float = 0.25
     rope_parameters: dict = field(default_factory=dict)
     rope_theta: float = 10_000_000.0
     tie_word_embeddings: bool = False
+    compile_moe: bool = False
+    compile_residual: bool = False
+    compile_injection: bool = False
+    compile_attention_output: bool = False
+    fuse_gdn_all: bool = False
+    compile_gdn_output: bool = False
+    prefused_moe: bool = False
+    prefused_gdn: bool = False
+    gdn_packed_t1: bool = False
+    gdn_packed_t1_max_context: int = 0
 
 
 @dataclass
@@ -295,7 +309,9 @@ class QSAIndexer(nn.Module):
         scores = mx.where(visible, scores, -mx.inf)
 
         k = min(self.block_topk, n_blocks)
-        top = mx.argpartition(-scores, k - 1, axis=-1)[..., :k]  # (B, S, k)
+        top = mx.stop_gradient(
+            mx.argpartition(-scores, k - 1, axis=-1)[..., :k]
+        )  # (B, S, k)
         picked = mx.take_along_axis(visible, top, axis=-1)
 
         # remap block -> tokens; the buffer's trailing partial block belongs to no
@@ -363,6 +379,41 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.indexer = QSAIndexer(args)
+        self.kv_fused = False
+        self.compiled_output = None
+
+    def fuse_quantized(self):
+        """Fuse packed MXFP4 projections that share an input."""
+        return self.fuse_quantized_kv()
+
+    def fuse_quantized_kv(self):
+        """Fuse packed MXFP4 key and value projections."""
+        if self.kv_fused:
+            return False
+        key, value = self.k_proj, self.v_proj
+        if not isinstance(key, nn.QuantizedLinear) or not isinstance(
+            value, nn.QuantizedLinear
+        ):
+            return False
+        if key.group_size != value.group_size or key.bits != value.bits:
+            return False
+        if key.mode != value.mode:
+            return False
+
+        key.weight = mx.concatenate([key["weight"], value["weight"]], axis=0)
+        key.scales = mx.concatenate([key["scales"], value["scales"]], axis=0)
+        if "biases" in key:
+            key.biases = mx.concatenate([key["biases"], value["biases"]], axis=0)
+        mx.eval(key["weight"], key["scales"])
+        self.v_proj = None
+        self.kv_fused = True
+        return True
+
+    def _output(self, out: mx.array, gate: mx.array) -> mx.array:
+        return self.o_proj(out * mx.sigmoid(gate))
+
+    def compile_decode(self):
+        self.compiled_output = mx.compile(self._output)
 
     def __call__(self, x, rope, mask, cache, idx_cache) -> mx.array:
         B, S, _ = x.shape
@@ -370,13 +421,20 @@ class Attention(nn.Module):
 
         sparse = self.indexer(x, rope, idx_cache, offset, _left_padding(cache))
 
-        q, gate = mx.split(self.q_proj(x).reshape(B, S, self.n_heads, -1), 2, axis=-1)
+        q_all = self.q_proj(x)
+        if self.kv_fused:
+            kv_flat = self.k_proj(x)
+        else:
+            kv_flat = None
+        q, gate = mx.split(q_all.reshape(B, S, self.n_heads, -1), 2, axis=-1)
         gate = gate.reshape(B, S, -1)
         q = self.q_norm(q).transpose(0, 2, 1, 3)
-        k = self.k_norm(self.k_proj(x).reshape(B, S, self.n_kv_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
-        v = self.v_proj(x).reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        if kv_flat is None:
+            k_flat, v_flat = self.k_proj(x), self.v_proj(x)
+        else:
+            k_flat, v_flat = mx.split(kv_flat, 2, axis=-1)
+        k = self.k_norm(k_flat.reshape(B, S, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        v = v_flat.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         cos, sin = rope(_positions(offset, S))
         cos, sin = cos[:, None], sin[:, None]
@@ -405,10 +463,36 @@ class Attention(nn.Module):
             q, k, v, cache=cache, scale=self.scale, mask=mask
         )
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-        return self.o_proj(out * mx.sigmoid(gate))
+        if self.compiled_output is not None and B == 1 and S == 1:
+            return self.compiled_output(out, gate)
+        return self._output(out, gate)
 
 
 # ------------------------------------------------------------------- gated deltanet
+
+
+def _gdn_output(
+    out: mx.array,
+    z: mx.array,
+    norm_weight: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+) -> mx.array:
+    normed = mx.fast.rms_norm(out, norm_weight, 1e-6)
+    gate = mx.sigmoid(z.astype(mx.float32))
+    hidden = (gate * normed.astype(mx.float32)).astype(out.dtype)
+    return mx.quantized_matmul(
+        hidden.reshape(*out.shape[:-2], -1),
+        weight,
+        scales=scales,
+        transpose=True,
+        group_size=32,
+        bits=4,
+        mode="mxfp4",
+    )
+
+
+_compiled_gdn_output = mx.compile(_gdn_output)
 
 
 class GatedDeltaNet(nn.Module):
@@ -422,6 +506,7 @@ class GatedDeltaNet(nn.Module):
         self.value_dim = self.dv * self.n_v
         self.conv_kernel_size = args.linear_conv_kernel_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.packed_t1 = bool(args.gdn_packed_t1)
         d = args.hidden_size
 
         self.conv1d = nn.Conv1d(
@@ -432,24 +517,120 @@ class GatedDeltaNet(nn.Module):
             groups=self.conv_dim,
             padding=0,
         )
-        # unlike qwen3-next, the projections are split
-        self.in_proj_qkv = nn.Linear(d, self.conv_dim, bias=False)
-        self.in_proj_z = nn.Linear(d, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(d, self.n_v, bias=False)
-        self.in_proj_a = nn.Linear(d, self.n_v, bias=False)
+        if args.prefused_gdn:
+            projection_dim = self.conv_dim + self.value_dim + 2 * self.n_v
+            self.in_proj_qkv = nn.Linear(d, projection_dim, bias=False)
+            self.in_proj_z = None
+            self.in_proj_b = None
+            self.in_proj_a = None
+            self.qkvz_fused = True
+            self.ba_fused = True
+            self.all_fused = True
+            self.fuse_all_projections = False
+        else:
+            # unlike qwen3-next, the projections are split
+            self.in_proj_qkv = nn.Linear(d, self.conv_dim, bias=False)
+            self.in_proj_z = nn.Linear(d, self.value_dim, bias=False)
+            self.in_proj_b = nn.Linear(d, self.n_v, bias=False)
+            self.in_proj_a = nn.Linear(d, self.n_v, bias=False)
+            self.qkvz_fused = False
+            self.ba_fused = False
+            self.all_fused = False
+            self.fuse_all_projections = args.fuse_gdn_all
         self.dt_bias = mx.ones(self.n_v)
         self.A_log = mx.zeros(self.n_v)
         self.norm = RMSNormGated(
             self.dv, eps=args.rms_norm_eps, activation=args.output_gate_type
         )
         self.out_proj = nn.Linear(self.value_dim, d, bias=False)
+        self.compiled_output = None
+
+    def _fuse_pair(self, first: str, second: str) -> bool:
+        first_module, second_module = getattr(self, first), getattr(self, second)
+        if not isinstance(first_module, nn.QuantizedLinear) or not isinstance(
+            second_module, nn.QuantizedLinear
+        ):
+            return False
+        if first_module.group_size != second_module.group_size:
+            return False
+        if first_module.bits != second_module.bits:
+            return False
+        if first_module.mode != second_module.mode:
+            return False
+
+        first_module.weight = mx.concatenate(
+            [first_module["weight"], second_module["weight"]], axis=0
+        )
+        first_module.scales = mx.concatenate(
+            [first_module["scales"], second_module["scales"]], axis=0
+        )
+        if "biases" in first_module:
+            first_module.biases = mx.concatenate(
+                [first_module["biases"], second_module["biases"]], axis=0
+            )
+        mx.eval(first_module["weight"], first_module["scales"])
+        setattr(self, second, None)
+        return True
+
+    def fuse_quantized(self):
+        """Fuse packed MXFP4 projections that share an input."""
+        count = 0
+        if not self.qkvz_fused and self._fuse_pair("in_proj_qkv", "in_proj_z"):
+            self.qkvz_fused = True
+            count += 1
+        if not self.ba_fused and self._fuse_pair("in_proj_b", "in_proj_a"):
+            self.ba_fused = True
+            count += 1
+        if (
+            self.fuse_all_projections
+            and self.qkvz_fused
+            and self.ba_fused
+            and not self.all_fused
+            and self._fuse_pair("in_proj_qkv", "in_proj_b")
+        ):
+            self.all_fused = True
+            count += 1
+        return count
+
+    def _output(self, out: mx.array, z: mx.array) -> mx.array:
+        return self.out_proj(self.norm(out, z).reshape(*out.shape[:-2], -1))
+
+    def compile_decode(self):
+        self.compiled_output = True
+
+    def _compiled_output(self, out: mx.array, z: mx.array) -> mx.array:
+        return _compiled_gdn_output(
+            out,
+            z,
+            self.norm.weight,
+            self.out_proj.weight,
+            self.out_proj.scales,
+        )
 
     def __call__(self, x, mask, cache) -> mx.array:
         B, S, _ = x.shape
-        mixed_qkv = self.in_proj_qkv(x)
-        z = self.in_proj_z(x).reshape(B, S, self.n_v, self.dv)
-        b = self.in_proj_b(x)
-        a = self.in_proj_a(x)
+        projection = self.in_proj_qkv(x)
+        if self.all_fused:
+            qkvz, ba = mx.split(
+                projection,
+                [self.conv_dim + self.value_dim],
+                axis=-1,
+            )
+            mixed_qkv, z_flat = mx.split(qkvz, [self.conv_dim], axis=-1)
+            b, a = mx.split(ba, 2, axis=-1)
+        else:
+            qkvz = projection
+            if self.qkvz_fused:
+                mixed_qkv, z_flat = mx.split(qkvz, [self.conv_dim], axis=-1)
+            else:
+                mixed_qkv = qkvz
+                z_flat = self.in_proj_z(x)
+            ba = self.in_proj_b(x)
+            if self.ba_fused:
+                b, a = mx.split(ba, 2, axis=-1)
+            else:
+                b, a = ba, self.in_proj_a(x)
+        z = z_flat.reshape(B, S, self.n_v, self.dv)
 
         conv_state = (
             cache[0]
@@ -491,11 +672,14 @@ class GatedDeltaNet(nn.Module):
             state,
             mask,
             use_kernel=not self.training,
+            allow_packed_t1=self.packed_t1,
         )
         if cache is not None:
             cache[1] = state
             cache.advance(S)
-        return self.out_proj(self.norm(out, z).reshape(B, S, -1))
+        if self.compiled_output is not None and B == 1 and S == 1:
+            return self._compiled_output(out, z)
+        return self._output(out, z)
 
 
 # ------------------------------------------------------------------------- MoE
@@ -507,17 +691,38 @@ class SparseMoeBlock(nn.Module):
         self.top_k = args.num_experts_per_tok
         self.gate = nn.Linear(args.hidden_size, args.num_experts, bias=False)
         self.switch_mlp = SwitchGLU(
-            args.hidden_size, args.moe_intermediate_size, args.num_experts
+            args.hidden_size,
+            args.moe_intermediate_size,
+            args.num_experts,
+            fused_gate_up=args.prefused_moe,
         )
         self.shared_expert = MLP(args.hidden_size, args.shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(args.hidden_size, 1, bias=False)
+        self.compiled_forward = None
+
+    def _forward(self, x: mx.array) -> mx.array:
+        logits = self.gate(x.astype(mx.float32))
+        idx = mx.stop_gradient(
+            mx.argpartition(-logits, self.top_k - 1, axis=-1)[..., : self.top_k]
+        )
+        w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
+        if self.switch_mlp.weight_before_down:
+            out = self.switch_mlp.weighted_sum(x, idx, w).astype(x.dtype)
+        else:
+            out = (self.switch_mlp(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
+        return out + mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
 
     def __call__(self, x: mx.array) -> mx.array:
-        logits = self.gate(x.astype(mx.float32))
-        idx = mx.argpartition(-logits, self.top_k - 1, axis=-1)[..., : self.top_k]
-        w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
-        out = (self.switch_mlp(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
-        return out + mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+        if self.compiled_forward is not None and x.shape[0] == 1 and x.shape[1] == 1:
+            return self.compiled_forward(x)
+        return self._forward(x)
+
+    def compile_decode(self):
+        self.compiled_forward = mx.compile(self._forward)
+
+    def fuse_quantized(self):
+        count = self.switch_mlp.fuse_gate_up()
+        return count + self.shared_expert.fuse_quantized()
 
 
 class MLP(nn.Module):
@@ -526,9 +731,37 @@ class MLP(nn.Module):
         self.gate_proj = nn.Linear(dim, hidden, bias=False)
         self.up_proj = nn.Linear(dim, hidden, bias=False)
         self.down_proj = nn.Linear(hidden, dim, bias=False)
+        self.fused_gate_up = False
+
+    def fuse_quantized(self):
+        """Fuse two packed MXFP4 projections into one matmul."""
+        if self.fused_gate_up:
+            return False
+        gate, up = self.gate_proj, self.up_proj
+        if not isinstance(gate, nn.QuantizedLinear) or not isinstance(
+            up, nn.QuantizedLinear
+        ):
+            return False
+        if gate.group_size != up.group_size or gate.bits != up.bits:
+            return False
+        if gate.mode != up.mode:
+            return False
+
+        gate.weight = mx.concatenate([gate["weight"], up["weight"]], axis=0)
+        gate.scales = mx.concatenate([gate["scales"], up["scales"]], axis=0)
+        if "biases" in gate:
+            gate.biases = mx.concatenate([gate["biases"], up["biases"]], axis=0)
+        mx.eval(gate["weight"], gate["scales"])
+        self.up_proj = None
+        self.fused_gate_up = True
+        return True
 
     def __call__(self, x):
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        if self.fused_gate_up:
+            gate, up = mx.split(self.gate_proj(x), 2, axis=-1)
+        else:
+            gate, up = self.gate_proj(x), self.up_proj(x)
+        return self.down_proj(nn.silu(gate) * up)
 
 
 # ------------------------------------------------------ hyper-connections (residual)
@@ -546,8 +779,9 @@ class GatedResidual(nn.Module):
         self.block_inject_weight = (
             nn.Linear(hc_dim, self.hc, bias=False) if use_combine else None
         )
+        self.compiled_forward = None
 
-    def __call__(self, hyper: mx.array):
+    def _forward(self, hyper: mx.array):
         normed = self.hc_norm(hyper)
         w = nn.silu(self.input_mix_weight_down(normed) / self.hc)
         w = mx.sigmoid(self.input_mix_weight_up(w))
@@ -557,6 +791,25 @@ class GatedResidual(nn.Module):
             return mixed
         inject = 2 * mx.sigmoid(self.block_inject_weight(normed) / self.hc)
         return mixed, hyper, inject
+
+    def __call__(self, hyper: mx.array):
+        if (
+            self.compiled_forward is not None
+            and hyper.shape[0] == 1
+            and hyper.shape[1] == 1
+        ):
+            return self.compiled_forward(hyper)
+        return self._forward(hyper)
+
+    def compile_decode(self):
+        self.compiled_forward = mx.compile(self._forward)
+
+
+def _inject_block(x: mx.array, hyper: mx.array, inject: mx.array) -> mx.array:
+    return hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
+
+
+_compiled_inject_block = mx.compile(_inject_block)
 
 
 # -------------------------------------------------------------- n-gram / PLE
@@ -626,8 +879,15 @@ class NGramEmbedding(nn.Module):
         self.n_shards = args.split_ngram_parts
         self.rows_per_shard = math.ceil(padded / self.n_shards)
         self.ngram_embedding = _ShardedEmbedding(
-            self.n_shards, self.rows_per_shard, head_dim
+            self.n_shards,
+            self.rows_per_shard,
+            head_dim,
+            args.ple_backend,
         )
+        self.hash_backend = "host"
+        if args.ple_backend:
+            self.hash_backend = args.ple_backend.get("hash_backend", "host")
+        self._ticket = None
 
         # buffers taken as-is from the checkpoint
         mults = []
@@ -649,6 +909,14 @@ class NGramEmbedding(nn.Module):
         self._sizes = mx.array(sizes, dtype=mx.int64)
         self._offsets = mx.array(offsets, dtype=mx.int64)
 
+    def _gid(self, ids: mx.array, prev_context: mx.array):
+        backend = self.hash_backend
+        if backend == "auto":
+            backend = "mlx" if ids.shape[0] == 1 else "host"
+        if backend == "mlx":
+            return self._mlx_gids(ids, prev_context)
+        return self._host_gids(ids, prev_context)
+
     def _shift_right(self, ids: mx.array, shift: int) -> mx.array:
         """Shift right by `shift`, without crossing an EOS boundary."""
         if shift == 0:
@@ -668,23 +936,78 @@ class NGramEmbedding(nn.Module):
         ok = (in_segment >= shift) & (src[None] >= 0)
         return mx.where(ok, gathered, self.eos_token_id)
 
-    def __call__(self, ids: mx.array, prev_context: mx.array) -> mx.array:
+    def _host_gids(self, ids: mx.array, prev_context: mx.array) -> np.ndarray:
         n_new = ids.shape[1]
-        history = mx.concatenate([prev_context, ids], axis=1).astype(mx.int64)
-        shifted = [self._shift_right(history, s) for s in range(self.ngram_size)]
+        history = np.concatenate(
+            [
+                np.asarray(prev_context.tolist(), dtype=np.int64),
+                np.asarray(ids.tolist(), dtype=np.int64),
+            ],
+            axis=1,
+        )
+        batch, length = history.shape
+        pos = np.arange(length)
+        eos_pos = np.where(history == self.eos_token_id, pos[None], -1)
+        prev_incl = np.maximum.accumulate(eos_pos, axis=1)
+        prev = np.concatenate(
+            [np.full((batch, 1), -1, dtype=np.int64), prev_incl[:, :-1]], axis=1
+        )
+        shifted = []
+        for shift in range(self.ngram_size):
+            src = pos[None] - shift
+            gathered = np.take_along_axis(
+                history, np.broadcast_to(np.maximum(src, 0), (batch, length)), axis=1
+            )
+            ok = ((pos[None] - prev - 1) >= shift) & (src >= 0)
+            shifted.append(np.where(ok, gathered, self.eos_token_id))
 
+        blocks = []
+        for ngram in range(2, self.ngram_size + 1):
+            lo = (ngram - 2) * self.heads_per_ngram
+            hi = lo + self.heads_per_ngram
+            mixed = shifted[0] * int(self._mults[0].item())
+            for p in range(1, ngram):
+                multiplier = int(self._mults[p].item())
+                mixed = np.bitwise_xor(mixed, shifted[p] * multiplier)
+            sizes = self._sizes[lo:hi].tolist()
+            offsets = self._offsets[lo:hi].tolist()
+            gids = [mixed % size + offset for size, offset in zip(sizes, offsets)]
+            blocks.append(np.stack(gids, axis=-1))
+
+        gid = np.concatenate(blocks, axis=-1)[:, -n_new:]
+        return gid
+
+    def _mlx_gids(self, ids: mx.array, prev_context: mx.array) -> mx.array:
+        n_new = ids.shape[1]
+        history = mx.concatenate([prev_context, ids], axis=1)
+        shifted = [
+            self._shift_right(history, shift) for shift in range(self.ngram_size)
+        ]
         blocks = []
         for ngram in range(2, self.ngram_size + 1):
             lo = (ngram - 2) * self.heads_per_ngram
             hi = lo + self.heads_per_ngram
             mixed = shifted[0] * self._mults[0]
             for p in range(1, ngram):
-                mixed = mx.bitwise_xor(mixed, shifted[p] * self._mults[p])
-            gid = mixed[..., None] % self._sizes[lo:hi].reshape(1, 1, -1)
-            blocks.append(gid + self._offsets[lo:hi].reshape(1, 1, -1))
+                mixed = mixed ^ (shifted[p] * self._mults[p])
+            gids = [mixed % self._sizes[i] + self._offsets[i] for i in range(lo, hi)]
+            blocks.append(mx.stack(gids, axis=-1))
+        return mx.concatenate(blocks, axis=-1)[:, -n_new:]
 
-        gid = mx.concatenate(blocks, axis=-1)[:, -n_new:]
+    def __call__(self, ids: mx.array, prev_context: mx.array) -> mx.array:
+        gid = self._gid(ids, prev_context)
         return self.ngram_embedding(gid).reshape(*gid.shape[:2], -1)
+
+    def issue(self, ids: mx.array, prev_context: mx.array):
+        gid = self._gid(ids, prev_context)
+        self._ticket = (self.ngram_embedding.issue(gid), gid.shape[:2])
+
+    def collect(self, ids: mx.array, prev_context: mx.array) -> mx.array:
+        if self._ticket is None:
+            return self(ids, prev_context)
+        ticket, shape = self._ticket
+        self._ticket = None
+        return self.ngram_embedding.collect(ticket).reshape(*shape, -1)
 
 
 _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)\.")
@@ -696,26 +1019,90 @@ _PER_EXPERT_RE = re.compile(
 class _ShardedEmbedding(nn.Module):
     """N embedding tables concatenated logically, addressed by global index."""
 
-    def __init__(self, n_shards: int, rows: int, dim: int):
+    def __init__(
+        self,
+        n_shards: int,
+        rows: int,
+        dim: int,
+        backend: dict | None = None,
+    ):
         super().__init__()
         self.n_shards = n_shards
         self.rows = rows
         self.dim = dim
-        # a list, so the keys are `shards.{i}.weight`: the layout mlx-vlm writes
-        # and `nn.quantize` walks; `sanitize` maps the HF `shard_{i}` onto it
-        self.shards = [nn.Embedding(rows, dim) for _ in range(n_shards)]
+        self.backend = backend
+        if backend is None:
+            # a list, so the keys are `shards.{i}.weight`: the layout mlx-vlm writes
+            # and `nn.quantize` walks; `sanitize` maps the HF `shard_{i}` onto it
+            self.shards = [nn.Embedding(rows, dim) for _ in range(n_shards)]
+            self.external = None
+        else:
+            self.shards = []
+            self.external = ExternalPleTable(
+                backend["root"],
+                n_shards=n_shards,
+                rows_per_shard=backend.get("rows_per_shard", rows),
+                max_inflight=backend.get("max_inflight", 32),
+                cache_rows=backend.get("cache_rows", 0),
+                prefetch=backend.get("prefetch", False),
+                read_backend=backend.get("read_backend", "pread"),
+            )
+            if self.external.rows_per_shard != rows:
+                self.close()
+                raise ValueError(
+                    f"PLE backend has {self.external.rows_per_shard} rows/shard, "
+                    f"expected {rows}"
+                )
+            if self.external.values_per_row != dim:
+                self.close()
+                raise ValueError(
+                    f"PLE backend has {self.external.values_per_row} values/row, "
+                    f"expected {dim}"
+                )
 
-    def __call__(self, gid: mx.array) -> mx.array:
-        flat = gid.reshape(-1)
-        shard_of = flat // self.rows
-        row_of = flat % self.rows
+    def close(self):
+        if self.external is not None:
+            self.external.close()
 
+    def clear_cache(self):
+        if self.external is not None:
+            self.external.clear_cache()
+
+    def issue(self, gid):
+        if self.external is None:
+            return None
+        return self.external.issue(gid)
+
+    def collect(self, ticket):
+        if self.external is None:
+            raise RuntimeError("resident PLE table has no external ticket")
+        return self.external.collect(ticket)
+
+    def __del__(self):
+        self.close()
+
+    def __call__(self, gid: mx.array | np.ndarray) -> mx.array:
+        if self.external is not None:
+            return self.external.gather(gid)
         # which shards are actually touched: decided host-side, as llama.cpp does
-        touched = np.unique(np.array(shard_of, copy=False))
-        out = mx.zeros((flat.size, self.dim), dtype=mx.float32)
+        flat_indices = gid.reshape(-1).tolist()
+        shard_indices = np.fromiter(
+            (i // self.rows for i in flat_indices),
+            dtype=np.int64,
+            count=len(flat_indices),
+        )
+        row_indices = np.fromiter(
+            (i % self.rows for i in flat_indices),
+            dtype=np.int64,
+            count=len(flat_indices),
+        )
+        touched = np.unique(shard_indices)
+        out = mx.zeros((len(flat_indices), self.dim), dtype=mx.float32)
         for s in touched.tolist():
-            sel = mx.array(np.nonzero(np.array(shard_of, copy=False) == s)[0])
-            emb = self.shards[s](mx.take(row_of, sel))
+            positions = np.nonzero(shard_indices == s)[0]
+            sel = mx.array(positions)
+            rows = mx.array(row_indices[positions])
+            emb = self.shards[s](rows)
             out = mx.put_along_axis(out, sel[:, None], emb.astype(mx.float32), axis=0)
         return out.reshape(*gid.shape, self.dim)
 
@@ -763,10 +1150,13 @@ class PLELayer(nn.Module):
                 cache[2] = mx.contiguous(full[:, -n:, :])
         return nn.silu(self.conv1d(full[:, -(n + S) :, :]))
 
+    def issue(self, ids: mx.array, prev_ctx: mx.array):
+        self.ple_embedding.issue(ids, prev_ctx)
+
     def __call__(
         self, hidden: mx.array, ids: mx.array, prev_ctx: mx.array, cache
     ) -> mx.array:
-        emb = self.ple_embedding(ids, prev_ctx).astype(hidden.dtype)
+        emb = self.ple_embedding.collect(ids, prev_ctx).astype(hidden.dtype)
         key = self.norm_key(self.key_proj(emb))
         key = key.reshape(*key.shape[:-1], self.hc, self.d)
         value = self.value_proj(emb)
@@ -800,6 +1190,7 @@ class DecoderLayer(nn.Module):
         self.ple = PLELayer(args, ple_idx) if ple_idx is not None else None
         self.attn_hyper_connection = GatedResidual(args)
         self.mlp_hyper_connection = GatedResidual(args)
+        self.compile_injection = args.compile_injection
 
     def __call__(self, h, rope, mask, conv_mask, cache, idx_cache, ids, prev_ctx):
         if self.ple is not None:
@@ -810,11 +1201,16 @@ class DecoderLayer(nn.Module):
             x = self.linear_attn(x, conv_mask, cache)
         else:
             x = self.self_attn(x, rope, mask, cache, idx_cache)
-        h = hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
+        if self.compile_injection and x.shape[0] == 1 and x.shape[1] == 1:
+            h = _compiled_inject_block(x, hyper, inject)
+        else:
+            h = _inject_block(x, hyper, inject)
 
         x, hyper, inject = self.mlp_hyper_connection(h)
         x = self.mlp(x)
-        return hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
+        if self.compile_injection and x.shape[0] == 1 and x.shape[1] == 1:
+            return _compiled_inject_block(x, hyper, inject)
+        return _inject_block(x, hyper, inject)
 
 
 class Qwen4ExpModel(nn.Module):
@@ -831,6 +1227,87 @@ class Qwen4ExpModel(nn.Module):
         self.ple_layers = [
             i for i in range(args.num_hidden_layers) if (i + 1) in args.ple_layer_ids
         ]
+        self.compile_moe = args.compile_moe
+        self.compile_residual = args.compile_residual
+        self.compile_injection = args.compile_injection
+        self.compile_attention_output = args.compile_attention_output
+        self.compile_gdn_output = args.compile_gdn_output
+        self.gdn_packed_t1_max_context = int(args.gdn_packed_t1_max_context or 0)
+        ple_backend = args.ple_backend or {}
+        self.ple_base_cache_rows = int(ple_backend.get("cache_rows", 0))
+        self.ple_long_cache_rows = int(ple_backend.get("long_context_cache_rows", 0))
+        self.ple_long_context_threshold = int(
+            ple_backend.get("long_context_threshold", 0)
+        )
+        self._ple_context_tokens = 0
+
+    def close_ple(self):
+        for i in self.ple_layers:
+            self.layers[i].ple.ple_embedding.ngram_embedding.close()
+
+    def set_ple_cache_capacity(self, cache_rows: int):
+        for i in self.ple_layers:
+            embedding = self.layers[i].ple.ple_embedding.ngram_embedding
+            if embedding.external is not None:
+                embedding.external.set_cache_capacity(cache_rows)
+
+    def prepare_prompt_tokens(self, total_tokens: int):
+        if (
+            self.ple_long_cache_rows > self.ple_base_cache_rows
+            and self.ple_long_context_threshold
+            and total_tokens > self.ple_long_context_threshold
+        ):
+            self.set_ple_cache_capacity(self.ple_long_cache_rows)
+
+    def clear_ple_cache(self, reset_capacity: bool = False):
+        for i in self.ple_layers:
+            embedding = self.layers[i].ple.ple_embedding.ngram_embedding
+            if embedding.external is None:
+                continue
+            if reset_capacity:
+                embedding.external.set_cache_capacity(self.ple_base_cache_rows)
+            else:
+                embedding.external.clear_cache()
+
+    def reset_prompt_cache(self, cache):
+        for layer_cache in cache:
+            layer_cache.reset()
+        self._ple_context_tokens = 0
+        if self.ple_base_cache_rows:
+            self.clear_ple_cache(reset_capacity=True)
+
+    def fuse_quantized(self):
+        count = sum(layer.mlp.fuse_quantized() for layer in self.layers)
+        count += sum(
+            layer.self_attn.fuse_quantized()
+            for layer in self.layers
+            if layer.layer_type == "full_attention"
+        )
+        count += sum(
+            layer.linear_attn.fuse_quantized()
+            for layer in self.layers
+            if layer.layer_type == "linear_attention"
+        )
+        mx.clear_cache()
+        return count
+
+    def compile_decode(self):
+        if self.compile_moe:
+            for layer in self.layers:
+                layer.mlp.compile_decode()
+        if self.compile_residual:
+            for layer in self.layers:
+                layer.attn_hyper_connection.compile_decode()
+                layer.mlp_hyper_connection.compile_decode()
+            self.hyper_connection_mixer.compile_decode()
+        if self.compile_attention_output:
+            for layer in self.layers:
+                if layer.layer_type == "full_attention":
+                    layer.self_attn.compile_decode()
+        if self.compile_gdn_output:
+            for layer in self.layers:
+                if layer.layer_type == "linear_attention":
+                    layer.linear_attn.compile_decode()
 
     def __call__(self, ids: mx.array, cache=None, input_embeddings=None):
         h = self.embed_tokens(ids) if input_embeddings is None else input_embeddings
@@ -862,6 +1339,14 @@ class Qwen4ExpModel(nn.Module):
                 if prev is not None
                 else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
             )
+            context_tokens = self._ple_context_tokens + ids.shape[1]
+            if (
+                self.ple_long_cache_rows > self.ple_base_cache_rows
+                and self.ple_long_context_threshold
+                and context_tokens > self.ple_long_context_threshold
+            ):
+                self.set_ple_cache_capacity(self.ple_long_cache_rows)
+            self._ple_context_tokens = context_tokens
             if pc is not None:
                 history = mx.concatenate([prev_ctx, ids], axis=1)
                 if pc.lengths is not None:
@@ -871,8 +1356,17 @@ class Qwen4ExpModel(nn.Module):
                     )
                 else:
                     pc[3] = history[:, -ctx_len:]
+            ple_embedding = self.layers[self.ple_layers[0]].ple.ple_embedding
+            external = ple_embedding.ngram_embedding.external
+            if external is not None and external.prefetch:
+                ple_embedding.issue(ids, prev_ctx)
 
         h = mx.tile(h, (1, 1, self.hc))
+        if self.gdn_packed_t1_max_context:
+            packed_t1 = self._ple_context_tokens <= self.gdn_packed_t1_max_context
+            for layer in self.layers:
+                if layer.layer_type == "linear_attention":
+                    layer.linear_attn.packed_t1 = packed_t1
         for layer, c in zip(self.layers, cache):
             idx_c = c.indexer if (c is not None and hasattr(c, "indexer")) else None
             h = layer(h, self.rope, mask, conv_mask, c, idx_c, ids, prev_ctx)
@@ -927,6 +1421,12 @@ class _AttnCache(KVCache):
     def merge(cls, caches):
         return _BatchAttnCache.merge(caches)
 
+    def reset(self):
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self.indexer.keys = None
+
 
 class _BatchAttnCache(BatchKVCache):
     """Batched `_AttnCache`. The indexer keys follow the KV padding exactly.
@@ -937,6 +1437,15 @@ class _BatchAttnCache(BatchKVCache):
     def __init__(self, left_padding):
         super().__init__(left_padding)
         self.indexer = _IndexerCache()
+
+    def reset(self):
+        self.keys = None
+        self.values = None
+        self.left_padding = mx.zeros_like(self.left_padding)
+        self.offset = mx.zeros_like(self.offset)
+        self._idx = 0
+        self._right_padding = None
+        self.indexer.keys = None
 
     def finalize(self):
         # The base class rolls a right padded prefill into left padding. The
@@ -1067,6 +1576,11 @@ class _LayerCache(ArraysCache):
         self.left_padding = None
         super().prepare(lengths=lengths, **kwargs)
 
+    def reset(self):
+        self.cache = [None] * len(self.cache)
+        self.left_padding = None
+        self.lengths = None
+
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -1074,6 +1588,11 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = Qwen4ExpModel(args.text)
+        self.compile_moe = args.text.compile_moe
+        self.compile_residual = args.text.compile_residual
+        self.compile_injection = args.text.compile_injection
+        self.compile_attention_output = args.text.compile_attention_output
+        self.compile_gdn_output = args.text.compile_gdn_output
         if not args.text.tie_word_embeddings:
             self.lm_head = nn.Linear(
                 args.text.hidden_size, args.text.vocab_size, bias=False
@@ -1089,9 +1608,28 @@ class Model(nn.Module):
     def layers(self):
         return self.model.layers
 
+    def close(self):
+        self.model.close_ple()
+
+    def clear_ple_cache(self):
+        self.model.clear_ple_cache()
+
+    def reset_prompt_cache(self, cache):
+        self.model.reset_prompt_cache(cache)
+
+    def prepare_prompt_tokens(self, total_tokens: int):
+        self.model.prepare_prompt_tokens(total_tokens)
+
+    def fuse_quantized(self):
+        return self.model.fuse_quantized()
+
+    def compile_decode(self):
+        """Compile the MoE block for single-token decode."""
+        self.model.compile_decode()
+
     def make_cache(self):
         caches = []
-        for i, t in enumerate(self.args.text.layer_types):
+        for _i, t in enumerate(self.args.text.layer_types):
             if t == "full_attention":
                 caches.append(_AttnCache())
             else:
@@ -1120,8 +1658,7 @@ class Model(nn.Module):
         # checkpoint saved from this file comes back flat as `model.*` with the
         # fold already applied, so it must not be folded twice.
         fold = any(
-            k.startswith(("model.language_model.", "language_model."))
-            for k in weights
+            k.startswith(("model.language_model.", "language_model.")) for k in weights
         )
 
         out = {}
@@ -1145,6 +1682,12 @@ class Model(nn.Module):
 
             # N-gram table: HF names the shards `shard_{i}`, this file `shards.{i}`.
             k = _NGRAM_SHARD_RE.sub(r".ngram_embedding.shards.\1.", k)
+            if self.args.text.ple_backend and ".ngram_embedding.shards." in k:
+                continue
+
+            if self.args.text.prefused_moe and ".mlp.switch_mlp.gate_up_proj." in k:
+                out[k.replace(".gate_up_proj.", ".gate_proj.")] = v
+                continue
 
             # Experts. Upstream stacks them as `experts.gate_up_proj`
             # (E, 2 * moe_intermediate, hidden) and `experts.down_proj`

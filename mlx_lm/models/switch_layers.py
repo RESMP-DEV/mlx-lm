@@ -164,13 +164,47 @@ class SwitchGLU(nn.Module):
         num_experts: int,
         activation=SwiGLU(),
         bias: bool = False,
+        fused_gate_up: bool = False,
     ):
         super().__init__()
 
-        self.gate_proj = SwitchLinear(input_dims, hidden_dims, num_experts, bias=bias)
-        self.up_proj = SwitchLinear(input_dims, hidden_dims, num_experts, bias=bias)
+        gate_output_dims = 2 * hidden_dims if fused_gate_up else hidden_dims
+        self.gate_proj = SwitchLinear(
+            input_dims, gate_output_dims, num_experts, bias=bias
+        )
+        self.up_proj = (
+            None
+            if fused_gate_up
+            else SwitchLinear(input_dims, hidden_dims, num_experts, bias=bias)
+        )
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
+        self.fused_gate_up = fused_gate_up
+        self.weight_before_down = False
+
+    def fuse_gate_up(self):
+        """Fuse two packed MXFP4 projections into one gather."""
+        if self.fused_gate_up:
+            return False
+        gate, up = self.gate_proj, self.up_proj
+        if not isinstance(gate, QuantizedSwitchLinear) or not isinstance(
+            up, QuantizedSwitchLinear
+        ):
+            return False
+        if gate.group_size != up.group_size or gate.bits != up.bits:
+            return False
+        if gate.mode != up.mode:
+            return False
+
+        weight = mx.concatenate([gate["weight"], up["weight"]], axis=1)
+        scales = mx.concatenate([gate["scales"], up["scales"]], axis=1)
+        mx.eval(weight, scales)
+        gate.weight = weight
+        gate.scales = scales
+        self.up_proj = None
+        self.fused_gate_up = True
+        mx.clear_cache()
+        return True
 
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
@@ -183,8 +217,13 @@ class SwitchGLU(nn.Module):
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        if self.fused_gate_up:
+            x_gate, x_up = mx.split(
+                self.gate_proj(x, idx, sorted_indices=do_sort), 2, axis=-1
+            )
+        else:
+            x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+            x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
         x = self.down_proj(
             self.activation(x_up, x_gate),
             idx,
@@ -195,6 +234,20 @@ class SwitchGLU(nn.Module):
             x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
+
+    def weighted_sum(self, x, indices, weights) -> mx.array:
+        """Apply router weights before the down projection for small batches."""
+        if indices.size >= 64:
+            return (self(x, indices) * weights[..., None]).sum(axis=-2)
+        x = mx.expand_dims(x, (-2, -3))
+        idx = mx.stop_gradient(indices)
+        if self.fused_gate_up:
+            x_gate, x_up = mx.split(self.gate_proj(x, idx), 2, axis=-1)
+        else:
+            x_up = self.up_proj(x, idx)
+            x_gate = self.gate_proj(x, idx)
+        hidden = self.activation(x_up, x_gate) * weights[..., None, None]
+        return self.down_proj(hidden, idx).squeeze(-2).sum(axis=-2)
 
 
 class SwitchMLP(nn.Module):

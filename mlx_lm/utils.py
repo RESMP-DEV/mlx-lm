@@ -559,6 +559,19 @@ def load_model(
 
     model.eval()
     model.load_weights(list(weights.items()), strict=strict)
+    if quantization is not None and hasattr(model, "fuse_quantized"):
+        model.fuse_quantized()
+    if any(
+        getattr(model, name, False)
+        for name in (
+            "compile_moe",
+            "compile_residual",
+            "compile_injection",
+            "compile_attention_output",
+            "compile_gdn_output",
+        )
+    ):
+        model.compile_decode()
 
     if not lazy:
         mx.eval(model.parameters())
