@@ -478,6 +478,61 @@ class Attention(nn.Module):
 # ------------------------------------------------------------------- gated deltanet
 
 
+def _make_gdn_conv_decode_kernel():
+    if not mx.metal.is_available():
+        return None
+
+    source = """
+        auto b = thread_position_in_grid.y;
+        auto c = thread_position_in_grid.x;
+        float acc = 0.0f;
+        for (int i = 0; i < W; i++) {
+            auto value = i + 1 < W ? state_in[(b * (W - 1) + i) * C + c]
+                                    : x[b * C + c];
+            acc += static_cast<float>(weight[c * W + i]) *
+                static_cast<float>(value);
+        }
+        T pre = static_cast<T>(acc);
+        T one = T(1);
+        T sig = one / (one + static_cast<T>(
+            metal::precise::exp(metal::abs(pre))));
+        sig = pre < 0 ? sig : one - sig;
+        y[b * C + c] = pre * sig;
+        for (int i = 0; i + 1 < W; i++) {
+            state_out[(b * (W - 1) + i) * C + c] =
+                state_in[(b * (W - 1) + i + 1) * C + c];
+        }
+        state_out[(b * (W - 1) + (W - 2)) * C + c] = x[b * C + c];
+    """
+    return mx.fast.metal_kernel(
+        name="gdn_conv_decode_update_v2",
+        input_names=["state_in", "x", "weight"],
+        output_names=["y", "state_out"],
+        source=source,
+    )
+
+
+_gdn_conv_decode_kernel = _make_gdn_conv_decode_kernel()
+
+
+def _gdn_conv_decode_update(state, x, weight):
+    """Run the T=1 depthwise convolution and roll the state in one launch."""
+    batch, _, channels = x.shape
+    width = weight.shape[1]
+    return _gdn_conv_decode_kernel(
+        inputs=[state, x, weight],
+        template=[
+            ("T", x.dtype),
+            ("W", width),
+            ("C", channels),
+        ],
+        grid=(channels, batch, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(batch, 1, channels), state.shape],
+        output_dtypes=[x.dtype, state.dtype],
+    )
+
+
 def _gdn_output(
     out: mx.array,
     z: mx.array,
@@ -646,17 +701,28 @@ class GatedDeltaNet(nn.Module):
         )
         if mask is not None:
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
-        conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
-        if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            if cache.lengths is not None:
-                # A right padded batch ends each row at its own length.
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
-        conv_out = nn.silu(self.conv1d(conv_input))
+        use_decode_kernel = (
+            S == 1
+            and cache is not None
+            and cache.lengths is None
+            and _gdn_conv_decode_kernel is not None
+        )
+        if use_decode_kernel:
+            conv_out, cache[0] = _gdn_conv_decode_update(
+                conv_state, mixed_qkv, self.conv1d.weight
+            )
+        else:
+            conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
+            if cache is not None:
+                n_keep = self.conv_kernel_size - 1
+                if cache.lengths is not None:
+                    # A right padded batch ends each row at its own length.
+                    ends = mx.clip(cache.lengths, 0, S)
+                    positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                    cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+                else:
+                    cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+            conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
         q = q.reshape(B, S, self.n_k, self.dk)

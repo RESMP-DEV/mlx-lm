@@ -241,6 +241,30 @@ class TestAttentionKVFusion(unittest.TestCase):
 
 
 class TestGDNProjectionFusion(unittest.TestCase):
+    def test_decode_conv_cache_kernel_is_bitwise(self):
+        from mlx_lm.models.qwen4_exp import _gdn_conv_decode_update
+
+        mx.random.seed(2509)
+        channels, width = 10240, 4
+        state = mx.random.normal((1, width - 1, channels), dtype=mx.bfloat16)
+        current = mx.random.normal((1, 1, channels), dtype=mx.bfloat16)
+        conv = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=width,
+            groups=channels,
+            bias=False,
+        )
+        conv.weight = mx.random.normal((channels, width, 1), dtype=mx.bfloat16) * 0.2
+        full_input = mx.concatenate([state, current], axis=1)
+        expected = nn.silu(conv(full_input))
+        expected_state = mx.contiguous(full_input[:, -(width - 1) :, :])
+        actual, actual_state = _gdn_conv_decode_update(state, current, conv.weight)
+        mx.eval(expected, expected_state, actual, actual_state)
+
+        self.assertTrue(bool(mx.all(expected == actual).item()))
+        self.assertTrue(bool(mx.all(expected_state == actual_state).item()))
+
     def test_mxfp4_projection_fusion_is_exact(self):
         from mlx_lm.models.qwen4_exp import GatedDeltaNet, TextArgs
 
