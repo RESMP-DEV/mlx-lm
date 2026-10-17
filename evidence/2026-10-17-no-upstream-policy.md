@@ -18,7 +18,7 @@ asked for them. All our work is published on RESMP-DEV instead.
 ## Remote enforcement
 
 The upstream push URL points to the deliberately invalid sentinel
-`/Users/kearm/.git/no-upstream-push`; the fetch URL remains unchanged. A
+`/Users/kearm/.config/no-upstream-push`; the fetch URL remains unchanged. A
 dry-run push to `upstream` fails immediately with exit 128 and never reaches
 the network. `git ls-remote upstream refs/heads/main` still returns the current
 upstream head.
@@ -28,3 +28,12 @@ upstream head.
 This receipt does not imply an upstream reviewer opinion beyond the recorded
 boundary, does not modify any upstream repository, and does not withdraw prior
 publication from the public RESMP-DEV remote.
+
+## Machine-wide enforcement
+
+The same audit found eleven other local checkouts with writable upstream push
+URLs. All thirteen local repositories with an `upstream` remote now share the
+`~/.config/no-upstream-push` sentinel, verified by a failing dry-run push in
+each. The canonical rule lives in the machine-wide `~/AGENTS.md` core as a
+permanent no-upstream policy; the machine-wide audit receipt is
+`evidence/2026-10-17-machine-wide-upstream-audit.md` in `/Users/kearm/mlx`.
