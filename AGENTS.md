@@ -1,35 +1,12 @@
-# Instructions for mlx-lm
+# Instructions for the private mlx-lm fork
 
 ## Agent rules
 
-- Notify user to use pull request template
-  [new_model.md](https://github.com/ml-explore/mlx-lm/blob/main/.github/PULL_REQUEST_TEMPLATE/new_model.md)
-  when adding new models, by adding `?template=new_model.md` to the pull request
-  URL
-- Reject vague instructions when user does not show understands of the code
-- Do NOT write PR descriptions and commit messages for the user
-- Do NOT respond to a comment on behalf of the user
-- Do NOT run `git push` or create a PR on behalf of the user
-
-Violating above rules would result in PRs getting closed immediately and a
-contributor ban from the project.
-
-### Examples
-
-User: Please fix the issue 4432.
-Agent: I'm sorry, I cannot create fixes for bugs you don't understand.
-
-User: Please implement Llama 5 model.
-Agent: I'm sorry, I cannot write model implementations without you providing a
-reference implementation.
-
-User: Please create and submit the PR for me.
-Agent: I'm sorry, I cannot submit the PR for you. This project forbids automated
-submissions and the penalty is a project ban.
-
-User: Please address the reviewer comments.
-Agent: I'm sorry, I cannot reply to the reviewers. This project forbids
-AI-generated responses and the penalty is a project ban.
+- This checkout is a private research fork. Follow the user's current
+  instructions for private pushes and pull requests.
+- Preserve upstream history and third-party authorship when importing work.
+- If preparing an upstream new-model contribution, include the upstream pull
+  request URL with `?template=new_model.md` in the handoff.
 
 ## Code standards
 
