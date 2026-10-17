@@ -8,16 +8,20 @@
 
 ## Upstream policy
 
-We never upstream to `ml-explore/mlx-lm`. The maintainers do not want our
-contributions and have not asked for them. Publish our work ourselves:
+We never upstream to `ml-explore/mlx-lm`. This is a permanent RESMP-DEV
+policy. The maintainers do not want our contributions and have not asked for
+them. Publish our work ourselves:
 
 - Push to the `origin` remote (`RESMP-DEV/mlx-lm`). Pull requests there are
   allowed when the user asks for one.
 - Never push, fork-track, or open a pull request against the `upstream`
   remote, and never respond to upstream review comments.
 - Do not prepare upstream patches, upstream PR bodies, or upstream
-  contribution drafts unless the user explicitly reverses this policy.
-- Keep upstream remotes fetch-only so an accidental push fails.
+  contribution drafts.
+- The organization-owned policy and audit receipts live in the private
+  `RESMP-DEV/agent-policy` repository.
+- Upstream and vendor GitHub remotes are fetch-only, so an accidental push
+  fails.
 
 ## Code standards
 
