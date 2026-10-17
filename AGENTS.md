@@ -3,10 +3,21 @@
 ## Agent rules
 
 - This checkout is a private research fork. Follow the user's current
-  instructions for private pushes and pull requests.
+  instructions for pushes and pull requests.
 - Preserve upstream history and third-party authorship when importing work.
-- If preparing an upstream new-model contribution, include the upstream pull
-  request URL with `?template=new_model.md` in the handoff.
+
+## Upstream policy
+
+We never upstream to `ml-explore/mlx-lm`. The maintainers do not want our
+contributions and have not asked for them. Publish our work ourselves:
+
+- Push to the `origin` remote (`RESMP-DEV/mlx-lm`). Pull requests there are
+  allowed when the user asks for one.
+- Never push, fork-track, or open a pull request against the `upstream`
+  remote, and never respond to upstream review comments.
+- Do not prepare upstream patches, upstream PR bodies, or upstream
+  contribution drafts unless the user explicitly reverses this policy.
+- Keep upstream remotes fetch-only so an accidental push fails.
 
 ## Code standards
 
