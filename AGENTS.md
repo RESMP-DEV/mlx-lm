@@ -1,8 +1,8 @@
-# Instructions for the private mlx-lm fork
+# Instructions for the RESMP-DEV mlx-lm fork
 
 ## Agent rules
 
-- This checkout is a private research fork. Follow the user's current
+- This checkout is the RESMP-DEV research fork. Follow the user's current
   instructions for pushes and pull requests.
 - Preserve upstream history and third-party authorship when importing work.
 
