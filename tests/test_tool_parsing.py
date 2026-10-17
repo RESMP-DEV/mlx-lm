@@ -10,8 +10,10 @@ from mlx_lm.tool_parsers import (
     kimi_k2,
     kimi_k3,
     longcat,
+    minicpm5,
     minimax_m2,
     mistral,
+    muse_spark,
     pythonic,
     qwen3_coder,
 )
@@ -40,6 +42,10 @@ class TestToolParsing(unittest.TestCase):
                 minimax_m2,
             ),
             (
+                '<function name="multiply"><param name="a">12234585</param><param name="b">48838483920</param></function>',
+                minicpm5,
+            ),
+            (
                 "<function=multiply>\n<parameter=a>\n12234585\n</parameter>\n<parameter=b>\n48838483920\n</parameter>\n</function>",
                 qwen3_coder,
             ),
@@ -58,6 +64,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 'multiply[ARGS]{"a": 12234585, "b": 48838483920}',
                 mistral,
+            ),
+            (
+                '<atem:invoke name="multiply">\n<atem:parameter name="a">12234585</atem:parameter><atem:parameter name="b">48838483920</atem:parameter>\n</atem:invoke>',
+                muse_spark,
             ),
         ]
 
@@ -110,6 +120,10 @@ class TestToolParsing(unittest.TestCase):
                 minimax_m2,
             ),
             (
+                '<function name="get_current_temperature"><param name="location">London</param></function>',
+                minicpm5,
+            ),
+            (
                 "<function=get_current_temperature>\n<parameter=location>\nLondon\n</parameter>\n</function>",
                 qwen3_coder,
             ),
@@ -128,6 +142,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 'get_current_temperature[ARGS]{"location": "London"}',
                 mistral,
+            ),
+            (
+                '<atem:invoke name="get_current_temperature">\n<atem:parameter name="location">London</atem:parameter>\n</atem:invoke>',
+                muse_spark,
             ),
         ]
         tools = [
@@ -239,6 +257,32 @@ class TestToolParsing(unittest.TestCase):
         tool_call = qwen3_coder.parse_tool_call(test_case, tools)
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
+
+    def test_qwen3_coder_untyped_param(self):
+        # Without a top-level "type", only JSON objects and arrays are parsed.
+        schema = {"anyOf": [{"type": "object"}, {"type": "array"}, {"type": "string"}]}
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {"type": "object", "properties": {"value": schema}},
+                },
+            }
+        ]
+        test_cases = [
+            ('{"kind": "new"}', {"kind": "new"}),
+            ('["a", "b"]', ["a", "b"]),
+            ("plain text", "plain text"),
+            ('["unfinished"', '["unfinished"'),
+            ("123", "123"),
+            ('"quoted"', '"quoted"'),
+        ]
+        for value, expected in test_cases:
+            with self.subTest(value=value):
+                call = f"<function=f><parameter=value>{value}</parameter></function>"
+                tool_call = qwen3_coder.parse_tool_call(call, tools)
+                self.assertEqual(tool_call["arguments"], {"value": expected})
 
     def test_pythonic_nested_args(self):
         # Containers are rendered with tojson, so they hold true/false/null.
@@ -577,6 +621,87 @@ class TestToolParsing(unittest.TestCase):
                 '<|open|>call index="1"<|sep|><|close|>call<|sep|>', None
             )
 
+    def test_minicpm5(self):
+        properties = {
+            "city": {"type": "string"},
+            "days": {"type": "integer"},
+            "metric": {"type": "boolean"},
+            "note": {"type": ["string", "null"]},
+            "opts": {"type": "object"},
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {"type": "object", "properties": properties},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "g",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"nums": {"type": "array"}},
+                    },
+                },
+            },
+        ]
+        test_cases = [
+            # Markers stripped, as the server passes it.
+            (
+                '"f"><param name="city">Paris</param><param name="days">3</param>'
+                '<param name="metric">true</param>',
+                {"city": "Paris", "days": 3, "metric": True},
+            ),
+            (
+                "<function name='f'>\n<param name='city'> Paris </param>\n</function>",
+                {"city": "Paris"},
+            ),
+            (
+                '<function name="f"><param name="days">3</param>'
+                '<param name="city"><![CDATA[a\n<b>&</b>\n]]></param></function>',
+                {"days": 3, "city": "a\n<b>&</b>\n"},
+            ),
+            # Truncated: complete params survive.
+            (
+                '"f"><param name="city">Paris</param><param name="days">3',
+                {"city": "Paris"},
+            ),
+            ('<function name="f"><param name="city"></param></function>', {"city": ""}),
+            # Nullable keeps its value; "None" stays a string.
+            ('"f"><param name="note">Paris</param>', {"note": "Paris"}),
+            ('"f"><param name="city">None</param>', {"city": "None"}),
+            # History renders dicts in Python style.
+            (
+                '"f"><param name="opts">' "{'unit': 'c'}</param>",
+                {"opts": {"unit": "c"}},
+            ),
+        ]
+        for text, arguments in test_cases:
+            with self.subTest(text=text):
+                tool_call = minicpm5.parse_tool_call(text, tools)
+                self.assertEqual(tool_call, {"name": "f", "arguments": arguments})
+
+        tool_calls = minicpm5.parse_tool_call(
+            '<function name="f"><param name="days">3</param></function>\n'
+            '<function name="g"><param name="nums">[1, 2]</param></function>\n'
+            '<function name="h"></function>',
+            tools,
+        )
+        self.assertEqual(
+            tool_calls,
+            [
+                {"name": "f", "arguments": {"days": 3}},
+                {"name": "g", "arguments": {"nums": [1, 2]}},
+                {"name": "h", "arguments": {}},
+            ],
+        )
+
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call("no call here", tools)
+
     def test_minimax_m2(self):
         test_case = (
             '<invoke name="search">\n'
@@ -592,6 +717,76 @@ class TestToolParsing(unittest.TestCase):
         ]
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
+
+    def test_muse_spark(self):
+        # The server strips the markers.
+        test_case = (
+            '\n<atem:invoke name="search">\n'
+            '<atem:parameter name="query">weather in Paris</atem:parameter>'
+            '<atem:parameter name="limit">5</atem:parameter>'
+            '<atem:parameter name="ratio">0.5</atem:parameter>'
+            '<atem:parameter name="safe">true</atem:parameter>'
+            '<atem:parameter name="tags">["a", "b"]</atem:parameter>'
+            '<atem:parameter name="filters">{"unit": "c"}</atem:parameter>\n'
+            "</atem:invoke>\n"
+        )
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case, None),
+            {
+                "name": "search",
+                "arguments": {
+                    "query": "weather in Paris",
+                    "limit": 5,
+                    "ratio": 0.5,
+                    "safe": True,
+                    "tags": ["a", "b"],
+                    "filters": {"unit": "c"},
+                },
+            },
+        )
+
+        test_case = (
+            '<atem:invoke name="write">\n'
+            '<atem:parameter name="content">line 1\n  </atem:invoke>\n"quoted" line\n'
+            "</atem:parameter>\n</atem:invoke>"
+        )
+        tool_call = muse_spark.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_call,
+            {
+                "name": "write",
+                "arguments": {"content": 'line 1\n  </atem:invoke>\n"quoted" line'},
+            },
+        )
+
+        # Any name without a double quote, also after another attribute.
+        test_case = (
+            '<atem:invoke name="f">\n'
+            '<atem:parameter name="a:b">1</atem:parameter>\n'
+            '<atem:parameter type="text" name="max tokens">two words</atem:parameter>\n'
+            "</atem:invoke>"
+        )
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case, None),
+            {"name": "f", "arguments": {"a:b": 1, "max tokens": "two words"}},
+        )
+
+        test_case = (
+            '<atem:invoke name="get_time">\n'
+            '<atem:parameter name="city">Paris</atem:parameter>\n'
+            "</atem:invoke>\n"
+            '<atem:invoke name="clock.now">\n</atem:invoke>\n'
+        )
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case, None),
+            [
+                {"name": "get_time", "arguments": {"city": "Paris"}},
+                {"name": "clock.now", "arguments": {}},
+            ],
+        )
+
+        with self.assertRaises(ValueError):
+            muse_spark.parse_tool_call("no call here", None)
 
     def test_qwen3_coder_iso_date(self):
         """Qwen3 coder parser should not crash on ISO 8601 dates."""
