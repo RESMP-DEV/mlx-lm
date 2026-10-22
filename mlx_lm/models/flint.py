@@ -237,6 +237,16 @@ class Model(nn.Module):
                 weights[f"{prefix}.switch_mlp.{name}.weight"] = mx.stack(experts)
         return weights
 
+    def fuse_gate_up(self):
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, SparseMoeBlock):
+                layer.mlp.switch_mlp.fuse_gate_up()
+
+    def load_weights(self, file_or_weights, strict: bool = True):
+        super().load_weights(file_or_weights, strict=strict)
+        self.fuse_gate_up()
+        return self
+
     def make_cache(self):
         caches = []
         for layer_type in self.args.layer_types:
