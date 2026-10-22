@@ -131,7 +131,6 @@ class SparseMoeBlock(nn.Module):
             args.hidden_size,
             args.moe_intermediate_size,
             args.num_experts,
-            activation=swiglu,
         )
         self.shared_expert = MLP(args.hidden_size, args.shared_expert_intermediate_size)
 

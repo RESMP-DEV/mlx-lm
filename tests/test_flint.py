@@ -88,3 +88,19 @@ def test_flint_sanitize_accepts_already_fused_experts():
         )
     }
     assert model.sanitize(weights) is weights
+
+
+def test_flint_routed_experts_use_standard_swiglu_order():
+    args = tiny_args()
+    model = flint.SparseMoeBlock(args)
+    x = mx.random.normal((1, 1, args.hidden_size))
+
+    indices = mx.array([[0]], dtype=mx.uint32)
+    actual = model.switch_mlp(x, indices)
+    gate = x @ model.switch_mlp.gate_proj.weight[0].T
+    up = x @ model.switch_mlp.up_proj.weight[0].T
+    expected = (gate * mx.sigmoid(gate) * up) @ model.switch_mlp.down_proj.weight[0].T
+
+    mx.eval(actual, expected)
+    assert actual.shape == (1, 1, 1, args.hidden_size)
+    assert mx.allclose(actual, expected[None], atol=1e-6)
