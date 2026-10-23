@@ -17,6 +17,7 @@ from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
+    MAX_TOP_LOGPROBS,
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
@@ -107,6 +108,25 @@ class MockCache:
     def trim(self, n):
         assert self._is_trimmable
         return n
+
+
+class TestTopLogprobs(unittest.TestCase):
+    def test_top_logprob_cap_supports_entropy_controller(self) -> None:
+        self.assertEqual(MAX_TOP_LOGPROBS, 20)
+
+    def test_format_returns_twenty_tokens(self) -> None:
+        from mlx_lm.server import _format_top_logprobs
+
+        values = mx.arange(32).astype(mx.float32) * -0.1
+
+        class Tokenizer:
+            @staticmethod
+            def convert_ids_to_tokens(ids):
+                return [f"token-{index}" for index in ids]
+
+        result = _format_top_logprobs(values, 20, Tokenizer())
+        self.assertEqual(len(result), 20)
+        self.assertTrue(all(item["logprob"] <= 0 for item in result))
 
 
 class TestTextStateMachine(unittest.TestCase):

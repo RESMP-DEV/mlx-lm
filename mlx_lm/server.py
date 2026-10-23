@@ -55,6 +55,8 @@ from .utils import (
     sharded_load,
 )
 
+MAX_TOP_LOGPROBS = 20
+
 
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
@@ -1433,7 +1435,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("frequency_penalty", (float, int))
         self._validate("frequency_context_size", int, min_val=0)
         self._validate("logprobs", bool)
-        self._validate("top_logprobs", int, min_val=0, max_val=11, whitelist=[-1])
+        self._validate(
+            "top_logprobs",
+            int,
+            min_val=0,
+            max_val=MAX_TOP_LOGPROBS,
+            whitelist=[-1],
+        )
         self._validate("xtc_probability", float, min_val=0, max_val=1)
         self._validate("xtc_threshold", float, min_val=0, max_val=1)
         self._validate("requested_model", str)
