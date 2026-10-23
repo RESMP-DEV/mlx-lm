@@ -876,6 +876,8 @@ class ResponseGenerator:
                         current_model_key, prompt
                     )
                     prompt_cache_count = len(prompt) - len(rest)
+                    full_segments = [list(segment) for segment in segments]
+                    full_segment_types = list(segment_types)
                     N = prompt_cache_count
                     while N > 0:
                         if N >= len(segments[0]):
@@ -884,6 +886,14 @@ class ResponseGenerator:
                         else:
                             segments[0] = segments[0][N:]
                             break
+                    if not segments:
+                        # The cached prefix covered the whole prompt, so no
+                        # segment is left to generate from. Re-prefill the
+                        # prompt instead of asking for an empty segment.
+                        cache = None
+                        prompt_cache_count = 0
+                        segments = full_segments
+                        segment_types = full_segment_types
 
                     ctx = GenerationContext(
                         has_tool_calling=current_tokenizer.has_tool_calling,
@@ -1118,6 +1128,12 @@ class ResponseGenerator:
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             rest = prompt[ctx.prompt_cache_count :]
+            if not rest:
+                # The cached prefix covered the whole prompt. Re-prefill the
+                # prompt instead of generating from an empty prompt.
+                cache = None
+                ctx.prompt_cache_count = 0
+                rest = prompt
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:

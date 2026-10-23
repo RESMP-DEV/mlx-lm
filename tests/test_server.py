@@ -509,6 +509,47 @@ class TestServer(unittest.TestCase):
         self.assertEqual(response.json(), {"status": "unavailable"})
 
 
+class TestExactPromptCacheHit(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.response_generator = ResponseGenerator(
+            DummyModelProvider(), LRUPromptCache()
+        )
+        cls.server_address = ("localhost", 0)
+        cls.httpd = http.server.HTTPServer(
+            cls.server_address,
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+    def test_exact_continuation_does_not_kill_the_generation_thread(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        prompt = "Once upon a time"
+        payload = {
+            "model": "default_model",
+            "prompt": prompt,
+            "max_tokens": 8,
+            "temperature": 0.0,
+        }
+        first = requests.post(url, json=payload)
+        self.assertEqual(first.status_code, 200)
+        continuation = prompt + first.json()["choices"][0]["text"]
+        second = requests.post(url, json={**payload, "prompt": continuation})
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.json()["choices"][0]["text"])
+        self.assertTrue(self.response_generator.generation_available())
+
+
 class TestServerWithDraftModel(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
