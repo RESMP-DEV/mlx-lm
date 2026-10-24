@@ -135,6 +135,19 @@ def _image_url(part: Dict[str, Any]) -> Optional[str]:
     return url.get("url") if isinstance(url, dict) else url
 
 
+def _system_prefix_end(sys_tokens: List[int], prompt: List[int]) -> int:
+    """Return the reusable system-prompt boundary in ``prompt``.
+
+    Some chat templates render the system prompt plus an empty user turn as an
+    exact token prefix of the full prompt. In that case no mismatch occurs, so
+    the prefix length itself is the checkpoint boundary.
+    """
+    for i, (a, b) in enumerate(zip(sys_tokens, prompt)):
+        if a != b:
+            return i
+    return len(sys_tokens) if len(sys_tokens) < len(prompt) else 0
+
+
 def _image_parts(messages: List[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
     for message in messages:
         content = message.get("content")
@@ -724,10 +737,7 @@ class ResponseGenerator:
                 add_generation_prompt=False,
                 **template_kwargs,
             )
-            for i, (a, b) in enumerate(zip(sys_tokens, prompt)):
-                if a != b:
-                    sys_end = i
-                    break
+            sys_end = _system_prefix_end(sys_tokens, prompt)
             if sys_end > 0 and sys_end < len(prompt):
                 segments.append(prompt[:sys_end])
                 segment_types.append("system")
